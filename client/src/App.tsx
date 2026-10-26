@@ -19,16 +19,18 @@ function detectInitialMode(): AuthMode {
 }
 
 function AppContent() {
-  const { session, loading, signOut } = useAuth()
+  const { session, loading, signOut, accountState, sessionOrigin } = useAuth()
   const [authMode, setAuthMode] = useState<AuthMode>(detectInitialMode)
   const [pendingEmail, setPendingEmail] = useState<string>('')
-  const [otpType, setOtpType] = useState<'signup' | 'magiclink'>('signup')
+  const [pendingDevOtp, setPendingDevOtp] = useState<string | undefined>(undefined)
   const [isOnline, setIsOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true
   )
+  /** Inline notice shown after a failed "Retry Connection" attempt. */
+  const [offlineNotice, setOfflineNotice] = useState<string | null>(null)
 
   useEffect(() => {
-    function handleOnline()  { setIsOnline(true) }
+    function handleOnline()  { setIsOnline(true); setOfflineNotice(null) }
     function handleOffline() { setIsOnline(false) }
     window.addEventListener('online',  handleOnline)
     window.addEventListener('offline', handleOffline)
@@ -37,6 +39,20 @@ function AppContent() {
       window.removeEventListener('offline', handleOffline)
     }
   }, [])
+
+  // Fallback guard. Self-registered users are now auto-provisioned on first
+  // authenticated load (see fetchProfile -> apiProvisionSelf), so reaching here
+  // with no profile means the provisioning call itself failed. Rather than
+  // trapping an existing credential holder on an error card, sign them out and
+  // let them retry. Run as an effect so we never signOut() during render.
+  const unprovisionedExistingUser =
+    accountState === 'unprovisioned' &&
+    sessionOrigin !== 'google' &&
+    sessionOrigin !== 'signup'
+
+  useEffect(() => {
+    if (session && unprovisionedExistingUser) signOut()
+  }, [session, unprovisionedExistingUser, signOut])
 
   // ── Offline banner ────────────────────────────────────────
   if (!isOnline) {
@@ -54,14 +70,29 @@ function AppContent() {
               <line x1="12" y1="20" x2="12.01" y2="20"/>
             </svg>
           </div>
-          <h2 style={{ fontFamily: 'Fraunces', fontSize: 22, fontWeight: 700, marginBottom: 10, color: 'var(--foreground)' }}>Access Denied</h2>
+          <h2 style={{ fontFamily: 'Inter', fontSize: 22, fontWeight: 700, marginBottom: 10, color: 'var(--foreground)' }}>Access Denied</h2>
           <p style={{ fontSize: 14, color: '#ef4444', fontWeight: 600, marginBottom: 8 }}>Internet is not connected</p>
           <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 24, lineHeight: 1.5 }}>
             You cannot access WINGTRACK while offline. Please check your network connection.
           </p>
+          {offlineNotice && (
+            <p
+              role="alert"
+              style={{ fontSize: 13, color: '#b91c1c', background: '#fee2e2', padding: '10px 14px', borderRadius: 8, marginBottom: 16, fontWeight: 500 }}
+            >
+              {offlineNotice}
+            </p>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <button id="retry-connection-btn" className="btn-primary"
-              onClick={() => { if (navigator.onLine) { setIsOnline(true); window.location.reload() } else { alert('Still offline. Please check your network connection.') } }}
+              onClick={() => {
+                if (navigator.onLine) {
+                  setIsOnline(true)
+                  window.location.reload()
+                } else {
+                  setOfflineNotice('Still offline — your device has no network connection yet. Reconnect to Wi-Fi or mobile data, then try again.')
+                }
+              }}
               style={{ width: '100%', padding: '12px', fontWeight: 600 }}>
               Retry Connection
             </button>
@@ -76,27 +107,35 @@ function AppContent() {
     )
   }
 
+  // ── Password Reset page ───────────────────────────────────
+  // Deliberately rendered before the `loading` and `if (session)` branches.
+  // A recovery link signs the user in, so waiting on the session would let the
+  // app briefly treat them as authenticated and flash the main interface —
+  // and the session must not be consulted at all while they are resetting.
+  // updatePassword() clears the session once the new password is saved, so
+  // finishing the flow lands on the login page.
+  if (authMode === 'reset') {
+    return (
+      <ResetPasswordPage
+        onDone={() => {
+          // Strip both the query flag and the recovery hash so a refresh cannot
+          // re-enter the reset flow with a stale token.
+          window.history.replaceState({}, '', window.location.pathname)
+          setAuthMode('login')
+        }}
+      />
+    )
+  }
+
   // ── Loading spinner ───────────────────────────────────────
   if (loading) {
     return (
       <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--background)' }}>
         <div style={{ textAlign: 'center' }}>
           <div className="spinner" style={{ width: 28, height: 28, borderWidth: 3 }} />
-          <p style={{ marginTop: 14, fontSize: 13, color: 'var(--muted-foreground)', fontFamily: 'DM Mono' }}>Loading WINGTRACK...</p>
+          <p style={{ marginTop: 14, fontSize: 13, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono' }}>Loading WINGTRACK...</p>
         </div>
       </div>
-    )
-  }
-
-  // ── Password Reset page ───────────────────────────────────
-  if (authMode === 'reset') {
-    return (
-      <ResetPasswordPage
-        onDone={() => {
-          window.history.replaceState({}, '', window.location.pathname)
-          setAuthMode('login')
-        }}
-      />
     )
   }
 
@@ -105,10 +144,77 @@ function AppContent() {
     return (
       <OTPVerificationPage
         email={pendingEmail}
-        type={otpType}
+        devOtp={pendingDevOtp}
         onVerified={() => setAuthMode('login')}
         onBack={() => setAuthMode('login')}
       />
+    )
+  }
+
+  // ── Unprovisioned account ─────────────────────────────────
+  // The account authenticated but has no staff_profiles row. We never
+  // synthesize a profile — but we also don't want to trap existing staff on an
+  // error card. The screen is shown only when the session was created
+  // self-service (Google OAuth or a fresh sign-up), i.e. a genuinely new
+  // account. A password/OTP sign-in means the person already had credentials,
+  // so an admin deactivating or never provisioning the profile is treated as a
+  // provisioning gap: we sign them out and return them to the login page.
+  if (session && accountState === 'unprovisioned') {
+    // Existing staff (password/OTP) are being signed out via the effect above;
+    // render nothing while that settles rather than flashing an error card.
+    if (unprovisionedExistingUser) return null
+
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--background)', padding: '24px 16px' }}>
+        <div className="card fade-in" style={{ padding: '36px 30px', maxWidth: 440, width: '100%', textAlign: 'center', boxShadow: '0 16px 40px rgba(0,0,0,0.12)', border: '1px solid rgba(239,68,68,0.25)' }}>
+          <div style={{ width: 60, height: 60, borderRadius: '50%', background: 'rgba(239,68,68,0.1)', color: '#ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 18px' }}>
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+          <h2 style={{ fontFamily: 'Inter', fontSize: 22, fontWeight: 700, marginBottom: 10, color: 'var(--foreground)' }}>
+            Access Not Provisioned
+          </h2>
+          <p style={{ fontSize: 14, color: '#ef4444', fontWeight: 600, marginBottom: 8 }}>
+            No staff profile is linked to this account
+          </p>
+          <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 24, lineHeight: 1.5 }}>
+            Your sign-in succeeded, but no staff profile has been set up for you yet. Please contact an administrator to be provisioned.
+          </p>
+          <button id="unprovisioned-signout" className="btn-primary" onClick={() => signOut()} style={{ width: '100%', padding: '12px', fontWeight: 600 }}>
+            Sign Out
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Deactivated account ───────────────────────────────────
+  if (session && accountState === 'deactivated') {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--background)', padding: '24px 16px' }}>
+        <div className="card fade-in" style={{ padding: '36px 30px', maxWidth: 440, width: '100%', textAlign: 'center', boxShadow: '0 16px 40px rgba(0,0,0,0.12)', border: '1px solid rgba(239,68,68,0.25)' }}>
+          <div style={{ width: 60, height: 60, borderRadius: '50%', background: 'rgba(239,68,68,0.1)', color: '#ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 18px' }}>
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+          <h2 style={{ fontFamily: 'Inter', fontSize: 22, fontWeight: 700, marginBottom: 10, color: 'var(--foreground)' }}>
+            Account Deactivated
+          </h2>
+          <p style={{ fontSize: 14, color: '#ef4444', fontWeight: 600, marginBottom: 8 }}>
+            This account has been switched off
+          </p>
+          <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 24, lineHeight: 1.5 }}>
+            An administrator has deactivated this account. Please contact your manager to restore access.
+          </p>
+          <button id="deactivated-signout" className="btn-primary" onClick={() => signOut()} style={{ width: '100%', padding: '12px', fontWeight: 600 }}>
+            Sign Out
+          </button>
+        </div>
+      </div>
     )
   }
 
@@ -122,9 +228,9 @@ function AppContent() {
     return (
       <SignUpPage
         onSwitchToLogin={() => setAuthMode('login')}
-        onRegistered={(email) => {
+        onRegistered={(email, devOtp) => {
           setPendingEmail(email)
-          setOtpType('signup')
+          setPendingDevOtp(devOtp)
           setAuthMode('otp')
         }}
       />
@@ -135,11 +241,6 @@ function AppContent() {
     <LoginPage
       onSwitchToSignUp={() => setAuthMode('signup')}
       onForgotPassword={() => setAuthMode('forgot')}
-      onOtpSent={(email) => {
-        setPendingEmail(email)
-        setOtpType('magiclink')
-        setAuthMode('otp')
-      }}
     />
   )
 }

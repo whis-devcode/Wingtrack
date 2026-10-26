@@ -11,6 +11,8 @@ dist/
 # Build outputs
 client/dist/
 server/dist/
+dist/
+*.tsbuildinfo
 
 # Logs
 *.log
@@ -19,24 +21,36 @@ npm-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# Editor & build files
+# Editor files
 .vscode/
+.workbuddy-ai/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-*.tsbuildinfo
-
-# Local certs
-certs/
-client/certs/
 
 # pnpm
 pnpm-lock.yaml
 .pnpm-store/
 
-# Figma Make internals
-.figma/
+# local scratch
+.git-msg.tmp
+
+# Audit / verification scratch (harness scripts, screenshots, run logs)
+.audit/
+
+# Supabase CLI scratch
+supabase/.temp/
+
+# Archives
+*.zip
+git_folder.zip
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/

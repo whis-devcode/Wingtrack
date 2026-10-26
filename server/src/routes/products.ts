@@ -1,9 +1,244 @@
-import { Router, type Response } from 'express'
+import express, { Router, type Response } from 'express'
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth'
 import { requireRole } from '../middleware/rbac'
 import { supabaseAdmin } from '../lib/supabase'
+import {
+  getProductType,
+  setProductType,
+  getAllProductTypes,
+  getProductCost,
+  setProductCost,
+  getAllProductCosts,
+} from '../lib/productMetadata'
 
 const router = Router()
+
+/** Upper bound for a menu price. Keeps values inside the numeric(10,2) column. */
+const MAX_PRICE = 1_000_000
+/** Upper bound for a recipe quantity per unit sold. */
+const MAX_QTY_PER_UNIT = 1_000_000
+
+/** Dish photos are capped at 5 MB, matching the avatar upload in staff.ts. */
+const MAX_MENU_IMAGE_BYTES = 5 * 1024 * 1024
+
+/** Image types the product-images bucket accepts. */
+const MENU_IMAGE_MIME: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+}
+
+/**
+ * Bucket holding dish photos.
+ *
+ * This is the bucket the seeded menu already uses, so uploads and the existing
+ * catalogue share one naming scheme — and replacing a seeded photo actually
+ * cleans the old object up rather than orphaning it in a second bucket.
+ *
+ * Deliberately separate from `avatars`: the two are policed differently (these
+ * are public marketing images, those are people), and keeping them apart means
+ * clearing one can never touch the other.
+ */
+const PRODUCT_IMAGE_BUCKET = 'product-images'
+
+/** Rejects a malformed `:id` before it reaches Postgres. */
+function requireUuidParam(req: AuthenticatedRequest, res: Response): string | null {
+  const id = String(req.params.id ?? '')
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    // Without this guard Postgres raises `invalid input syntax for type uuid`,
+    // which surfaces to the client as a 500 echoing the raw database error.
+    res.status(400).json({ message: 'Invalid product id.' })
+    return null
+  }
+  return id
+}
+
+/**
+ * Validate a price coming from the client.
+ * Returns the normalised number, or an error message.
+ */
+function parsePrice(raw: unknown): { ok: true; value: number } | { ok: false; message: string } {
+  if (typeof raw !== 'number' && typeof raw !== 'string') {
+    return { ok: false, message: 'Price must be a number.' }
+  }
+  const value = Number(raw)
+  if (!Number.isFinite(value)) {
+    return { ok: false, message: 'Price must be a valid number.' }
+  }
+  if (value < 0) {
+    return { ok: false, message: 'Price must be 0 or greater.' }
+  }
+  if (value > MAX_PRICE) {
+    return { ok: false, message: `Price must not exceed ${MAX_PRICE.toLocaleString()}.` }
+  }
+  return { ok: true, value: Math.round(value * 100) / 100 }
+}
+
+/**
+ * Validate a unit cost (cost price) coming from the client.
+ * Defaults to 0 when omitted, and validates range.
+ */
+function parseCost(raw: unknown): { ok: true; value: number } | { ok: false; message: string } {
+  if (raw === undefined || raw === null || raw === '') {
+    return { ok: true, value: 0 }
+  }
+  if (typeof raw !== 'number' && typeof raw !== 'string') {
+    return { ok: false, message: 'Unit cost must be a number.' }
+  }
+  const value = Number(raw)
+  if (!Number.isFinite(value)) {
+    return { ok: false, message: 'Unit cost must be a valid number.' }
+  }
+  if (value < 0) {
+    return { ok: false, message: 'Unit cost must be 0 or greater.' }
+  }
+  if (value > MAX_PRICE) {
+    return { ok: false, message: `Unit cost must not exceed ${MAX_PRICE.toLocaleString()}.` }
+  }
+  return { ok: true, value: Math.round(value * 100) / 100 }
+}
+
+
+/**
+ * Validate and normalise the recipe list.
+ * Silently drops malformed rows rather than failing the whole request,
+ * but never lets a non-finite / out-of-range quantity reach the database.
+ */
+function parseRecipes(
+  raw: unknown,
+  productId: string,
+): Array<{ product_id: string; inventory_id: string; qty_per_unit: number }> {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((r): r is { inventory_id?: unknown; qty_per_unit?: unknown } => !!r && typeof r === 'object')
+    .map(r => {
+      const qty = Number(r.qty_per_unit)
+      return { inventory_id: typeof r.inventory_id === 'string' ? r.inventory_id : '', qty }
+    })
+    .filter(
+      r =>
+        r.inventory_id !== '' &&
+        Number.isFinite(r.qty) &&
+        r.qty > 0 &&
+        r.qty <= MAX_QTY_PER_UNIT,
+    )
+    .map(r => ({
+      product_id: productId,
+      inventory_id: r.inventory_id,
+      qty_per_unit: r.qty,
+    }))
+}
+
+// ── Dish photos ──────────────────────────────────────────────
+/*
+ * Uploads mirror the staff-avatar path in `staff.ts`, and for the same reason:
+ * the bytes are written with the service-role key, so photos work on a project
+ * where the Storage RLS policies have not been created yet. The client never
+ * talks to Storage directly.
+ *
+ * The image is uploaded to its own endpoint AFTER the product row exists,
+ * rather than being part of the create payload. That keeps one write path for
+ * photos (so "add" and "change" cannot drift apart) and means the object path
+ * can be keyed on a real product id.
+ */
+
+/**
+ * Creates the `product-images` bucket if it is missing.
+ *
+ * A fresh project will not have it, and a missing bucket surfaces to the user
+ * as an opaque upload failure. Creating it on demand keeps the feature
+ * self-contained.
+ */
+async function ensureProductImagesBucket() {
+  try {
+    const { data } = await supabaseAdmin.storage.getBucket(PRODUCT_IMAGE_BUCKET)
+    if (data) return
+  } catch {
+    // getBucket throws when the bucket is absent — fall through and create it.
+  }
+
+  const { error } = await supabaseAdmin.storage.createBucket(PRODUCT_IMAGE_BUCKET, {
+    public: true,
+    fileSizeLimit: MAX_MENU_IMAGE_BYTES,
+    allowedMimeTypes: Object.keys(MENU_IMAGE_MIME),
+  })
+
+  // A concurrent request may have created it first; that is not a failure.
+  if (error && !/already exists/i.test(error.message)) {
+    console.warn('[Products] Could not create the product-images bucket:', error.message)
+  }
+}
+
+/**
+ * Validates the raw image body of a dish-photo upload.
+ *
+ * Returns the decoded buffer plus the extension to store it under, or null
+ * after having already sent the failure response — so callers can simply
+ * `if (!image) return`.
+ */
+function readMenuImageUpload(
+  req: AuthenticatedRequest,
+  res: Response,
+): { body: Buffer; contentType: string; ext: string } | null {
+  const contentType = String(req.headers['content-type'] ?? '').split(';')[0].trim()
+  const ext = MENU_IMAGE_MIME[contentType]
+
+  if (!ext) {
+    res.status(415).json({ message: 'Only JPG, PNG or WebP images are supported.' })
+    return null
+  }
+
+  const body = req.body as Buffer
+  if (!Buffer.isBuffer(body) || body.length === 0) {
+    res.status(400).json({ message: 'The uploaded file is empty.' })
+    return null
+  }
+  if (body.length > MAX_MENU_IMAGE_BYTES) {
+    res.status(413).json({ message: 'Image must be 5 MB or smaller.' })
+    return null
+  }
+
+  return { body, contentType, ext }
+}
+
+/**
+ * Writes image bytes to the product-images bucket and returns the public URL.
+ *
+ * The filename carries a timestamp so a replaced photo is served from a new
+ * URL. This is load-bearing, not tidiness: the bucket is public and served
+ * through a CDN that honours `cacheControl`, so a deleted object can keep
+ * answering 200 from an edge node for up to an hour. Overwriting a fixed
+ * filename would therefore leave browsers showing the old dish photo long
+ * after the new one was uploaded.
+ */
+async function storeMenuImageObject(
+  productId: string,
+  body: Buffer,
+  contentType: string,
+  ext: string,
+): Promise<{ url: string } | { error: string }> {
+  await ensureProductImagesBucket()
+
+  const path = `${productId}/dish-${Date.now()}.${ext}`
+  const { error } = await supabaseAdmin.storage
+    .from(PRODUCT_IMAGE_BUCKET)
+    .upload(path, body, { contentType, upsert: true, cacheControl: '3600' })
+
+  if (error) return { error: error.message }
+
+  const { data } = supabaseAdmin.storage.from(PRODUCT_IMAGE_BUCKET).getPublicUrl(path)
+  return { url: data.publicUrl }
+}
+
+/** Deletes the stored object behind a dish-photo URL. Best effort by design. */
+async function deleteMenuImageObject(url: string | null | undefined) {
+  const path = url?.split(`/${PRODUCT_IMAGE_BUCKET}/`)[1]
+  if (!path) return
+  await supabaseAdmin.storage.from(PRODUCT_IMAGE_BUCKET).remove([path]).catch(() => undefined)
+}
+
+/** Express middleware chain for a raw image body. */
+const rawImage = express.raw({ type: Object.keys(MENU_IMAGE_MIME), limit: MAX_MENU_IMAGE_BYTES })
 
 /**
  * GET /api/products
@@ -18,7 +253,14 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res: Response): P
       .order('name')
 
     if (error) throw error
-    res.json(data)
+    const typesMap = getAllProductTypes()
+    const costsMap = getAllProductCosts()
+    const enriched = (data || []).map((p: any) => ({
+      ...p,
+      product_type: p.product_type || typesMap[p.id] || 'Regular',
+      unit_cost: p.unit_cost != null ? Number(p.unit_cost) : (costsMap[p.id] ?? 0),
+    }))
+    res.json(enriched)
   } catch (err: unknown) {
     console.error('[Products] Failed to list products:', err)
     res.status(500).json({ message: 'Failed to fetch products.' })
@@ -55,7 +297,21 @@ router.post('/categories', requireAuth, requireRole('admin'), async (req: Authen
     return
   }
 
+  const trimmedName = name.trim()
+
   try {
+    // Check if category name already exists (case-insensitive)
+    const { data: existing } = await supabaseAdmin
+      .from('product_categories')
+      .select('id, name')
+      .ilike('name', trimmedName)
+      .maybeSingle()
+
+    if (existing) {
+      res.status(409).json({ message: `A category named "${existing.name}" already exists.` })
+      return
+    }
+
     const { data: countData } = await supabaseAdmin
       .from('product_categories')
       .select('sort_order', { count: 'exact' })
@@ -64,11 +320,17 @@ router.post('/categories', requireAuth, requireRole('admin'), async (req: Authen
 
     const { data, error } = await supabaseAdmin
       .from('product_categories')
-      .insert({ name: name.trim(), sort_order: nextOrder })
+      .insert({ name: trimmedName, sort_order: nextOrder })
       .select()
       .single()
 
-    if (error) throw error
+    if (error) {
+      if (error.code === '23505') {
+        res.status(409).json({ message: `A category named "${trimmedName}" already exists.` })
+        return
+      }
+      throw error
+    }
     res.status(201).json(data)
   } catch (err: unknown) {
     console.error('[Products] Failed to create category:', err)
@@ -82,66 +344,125 @@ router.post('/categories', requireAuth, requireRole('admin'), async (req: Authen
  * Supports adding recipe ingredient mappings at the same time.
  */
 router.post('/', requireAuth, requireRole('admin'), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const { name, category_id, price, is_available = true, image_url, recipes } = req.body as {
+  const { name, category_id, price, unit_cost, is_available = true, image_url, recipes, product_type } = req.body as {
     name?: string
     category_id?: string
     price?: number
+    unit_cost?: number
     is_available?: boolean
     image_url?: string
     recipes?: Array<{ inventory_id: string; qty_per_unit: number }>
+    product_type?: string
   }
 
-  if (!name?.trim() || !category_id || price == null) {
-    res.status(400).json({ message: 'Name, category, and price are required.' })
+  if (typeof name !== 'string' || !name.trim()) {
+    res.status(400).json({ message: 'Product name is required.' })
     return
   }
 
-  if (Number(price) < 0) {
-    res.status(400).json({ message: 'Price must be 0 or greater.' })
+  if (typeof category_id !== 'string' || !category_id) {
+    res.status(400).json({ message: 'Category is required.' })
     return
   }
+
+  if (price == null) {
+    res.status(400).json({ message: 'Price is required.' })
+    return
+  }
+
+  const parsedPrice = parsePrice(price)
+  if (!parsedPrice.ok) {
+    res.status(400).json({ message: parsedPrice.message })
+    return
+  }
+
+  const parsedCost = parseCost(unit_cost)
+  if (!parsedCost.ok) {
+    res.status(400).json({ message: parsedCost.message })
+    return
+  }
+
+  const typeToSet = ['Regular', 'Bestseller', 'New', 'Seasonal', 'Special'].includes(String(product_type))
+    ? String(product_type)
+    : 'Regular'
 
   try {
-    // 1. Insert product
-    const { data: newProduct, error: prodErr } = await supabaseAdmin
+    // 1. Insert product (try with unit_cost and product_type, graceful fallback if column not yet migrated)
+    const basePayload: Record<string, unknown> = {
+      name: name.trim().slice(0, 120),
+      category_id,
+      price: parsedPrice.value,
+      unit_cost: parsedCost.value,
+      is_available: Boolean(is_available),
+      image_url: typeof image_url === 'string' ? image_url.trim().slice(0, 500) || null : null,
+      product_type: typeToSet,
+    }
+
+    let newProduct: any = null
+    let prodErr: any = null
+
+    const firstTry = await supabaseAdmin
       .from('products')
-      .insert({
-        name: name.trim(),
-        category_id,
-        price: Number(price),
-        is_available,
-        image_url: image_url?.trim() || null,
-      })
+      .insert(basePayload)
       .select('*, category:product_categories(id, name, sort_order)')
       .single()
 
-    if (prodErr) throw prodErr
+    if (firstTry.error && firstTry.error.code === 'PGRST204') {
+      const strippedPayload = { ...basePayload }
+      delete strippedPayload.product_type
+      delete strippedPayload.unit_cost
+      const secondTry = await supabaseAdmin
+        .from('products')
+        .insert(strippedPayload)
+        .select('*, category:product_categories(id, name, sort_order)')
+        .single()
+      newProduct = secondTry.data
+      prodErr = secondTry.error
+    } else {
+      newProduct = firstTry.data
+      prodErr = firstTry.error
+    }
+
+    if (prodErr) {
+      if (prodErr.code === '23503') {
+        res.status(400).json({ message: 'That category no longer exists. Please pick another one.' })
+        return
+      }
+      throw prodErr
+    }
+
+    if (!newProduct) {
+      throw new Error('Failed to create product row.')
+    }
+
+    // Persist product_type and unit_cost metadata cache
+    setProductType(newProduct.id, typeToSet)
+    setProductCost(newProduct.id, parsedCost.value)
 
     // 2. Insert recipes if provided
-    if (recipes && Array.isArray(recipes) && recipes.length > 0) {
-      const validRecipes = recipes
-        .filter(r => r.inventory_id && Number(r.qty_per_unit) > 0)
-        .map(r => ({
-          product_id: newProduct.id,
-          inventory_id: r.inventory_id,
-          qty_per_unit: Number(r.qty_per_unit),
-        }))
+    const validRecipes = parseRecipes(recipes, newProduct.id)
+    if (validRecipes.length > 0) {
+      const { error: recErr } = await supabaseAdmin
+        .from('product_recipes')
+        .insert(validRecipes)
 
-      if (validRecipes.length > 0) {
-        const { error: recErr } = await supabaseAdmin
-          .from('product_recipes')
-          .insert(validRecipes)
-
-        if (recErr) {
-          console.warn('[Products] Product created, but recipe mapping had error:', recErr)
+      if (recErr) {
+        // Roll the product back so the caller never ends up with a half-created item.
+        console.warn('[Products] Recipe mapping failed — rolling back product creation:', recErr)
+        const { error: rollbackErr } = await supabaseAdmin.from('products').delete().eq('id', newProduct.id)
+        if (rollbackErr) {
+          console.error('CRITICAL: failed to roll back product after recipe failure:', rollbackErr)
         }
+        res.status(400).json({ message: 'Could not save the recipe ingredients, so the product was not created. Please check the ingredient quantities and try again.' })
+        return
       }
     }
 
-    res.status(201).json(newProduct)
+    res.status(201).json({ ...newProduct, product_type: typeToSet, unit_cost: parsedCost.value })
   } catch (err: unknown) {
+    // Log the real error server-side; never hand raw database text to the client.
     console.error('[Products] Failed to create product:', err)
-    res.status(500).json({ message: (err as Error).message || 'Failed to create product.' })
+    res.status(500).json({ message: 'Failed to create product. Please try again.' })
   }
 })
 
@@ -150,57 +471,135 @@ router.post('/', requireAuth, requireRole('admin'), async (req: AuthenticatedReq
  * Update product details and optionally update recipe ingredients (Admin only).
  */
 router.patch('/:id', requireAuth, requireRole('admin'), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const { id } = req.params
-  const { name, category_id, price, is_available, image_url, recipes } = req.body as {
+  const { id } = req.params as { id: string }
+  const { name, category_id, price, unit_cost, is_available, image_url, recipes, product_type } = req.body as {
     name?: string
     category_id?: string
     price?: number
+    unit_cost?: number
     is_available?: boolean
     image_url?: string
     recipes?: Array<{ inventory_id: string; qty_per_unit: number }>
+    product_type?: string
   }
 
   const updates: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   }
-  if (name !== undefined) updates.name = name.trim()
-  if (category_id !== undefined) updates.category_id = category_id
-  if (price !== undefined) updates.price = Number(price)
-  if (is_available !== undefined) updates.is_available = is_available
-  if (image_url !== undefined) updates.image_url = image_url?.trim() || null
+  if (name !== undefined) {
+    if (typeof name !== 'string' || !name.trim()) {
+      res.status(400).json({ message: 'Product name cannot be empty.' })
+      return
+    }
+    updates.name = name.trim().slice(0, 120)
+  }
+  if (category_id !== undefined) {
+    if (typeof category_id !== 'string' || !category_id) {
+      res.status(400).json({ message: 'Category cannot be empty.' })
+      return
+    }
+    updates.category_id = category_id
+  }
+  if (price !== undefined) {
+    const parsedPrice = parsePrice(price)
+    if (!parsedPrice.ok) {
+      res.status(400).json({ message: parsedPrice.message })
+      return
+    }
+    updates.price = parsedPrice.value
+  }
+
+  let costToSet: number | undefined = undefined
+  if (unit_cost !== undefined) {
+    const parsedCost = parseCost(unit_cost)
+    if (!parsedCost.ok) {
+      res.status(400).json({ message: parsedCost.message })
+      return
+    }
+    costToSet = parsedCost.value
+    updates.unit_cost = costToSet
+    setProductCost(id, costToSet)
+  }
+
+  if (is_available !== undefined) updates.is_available = Boolean(is_available)
+  if (image_url !== undefined) {
+    updates.image_url = typeof image_url === 'string' ? image_url.trim().slice(0, 500) || null : null
+  }
+
+  let typeToSet: string | undefined = undefined
+  if (product_type !== undefined) {
+    typeToSet = ['Regular', 'Bestseller', 'New', 'Seasonal', 'Special'].includes(String(product_type))
+      ? String(product_type)
+      : 'Regular'
+    updates.product_type = typeToSet
+    setProductType(id, typeToSet)
+  }
 
   try {
-    const { data: updatedProduct, error: updateErr } = await supabaseAdmin
+    let updatedProduct: any = null
+    let updateErr: any = null
+
+    const firstTry = await supabaseAdmin
       .from('products')
       .update(updates)
       .eq('id', id)
       .select('*, category:product_categories(id, name, sort_order)')
-      .single()
+      .maybeSingle()
 
-    if (updateErr) throw updateErr
+    if (firstTry.error && firstTry.error.code === 'PGRST204') {
+      const strippedUpdates = { ...updates }
+      delete strippedUpdates.product_type
+      delete strippedUpdates.unit_cost
+      const secondTry = await supabaseAdmin
+        .from('products')
+        .update(strippedUpdates)
+        .eq('id', id)
+        .select('*, category:product_categories(id, name, sort_order)')
+        .maybeSingle()
+      updatedProduct = secondTry.data
+      updateErr = secondTry.error
+    } else {
+      updatedProduct = firstTry.data
+      updateErr = firstTry.error
+    }
+
+    if (updateErr) {
+      if (updateErr.code === '23503') {
+        res.status(400).json({ message: 'That category no longer exists. Please pick another one.' })
+        return
+      }
+      throw updateErr
+    }
+
+    if (!updatedProduct) {
+      res.status(404).json({ message: 'Product not found.' })
+      return
+    }
 
     // Update recipes if provided
     if (recipes && Array.isArray(recipes)) {
       // Delete existing recipes for this product
       await supabaseAdmin.from('product_recipes').delete().eq('product_id', id)
 
-      const validRecipes = recipes
-        .filter(r => r.inventory_id && Number(r.qty_per_unit) > 0)
-        .map(r => ({
-          product_id: id,
-          inventory_id: r.inventory_id,
-          qty_per_unit: Number(r.qty_per_unit),
-        }))
-
+      const validRecipes = parseRecipes(recipes, id)
       if (validRecipes.length > 0) {
-        await supabaseAdmin.from('product_recipes').insert(validRecipes)
+        const { error: recErr } = await supabaseAdmin.from('product_recipes').insert(validRecipes)
+        if (recErr) {
+          console.warn('[Products] Recipe update had an error:', recErr)
+          res.status(400).json({ message: 'Product details were saved, but the recipe ingredients could not be. Please review the ingredient quantities.' })
+          return
+        }
       }
     }
 
-    res.json(updatedProduct)
+    const finalType = typeToSet || updatedProduct.product_type || getProductType(id) || 'Regular'
+    const finalCost = costToSet !== undefined
+      ? costToSet
+      : (updatedProduct.unit_cost != null ? Number(updatedProduct.unit_cost) : getProductCost(id))
+    res.json({ ...updatedProduct, product_type: finalType, unit_cost: finalCost })
   } catch (err: unknown) {
     console.error('[Products] Failed to update product:', err)
-    res.status(500).json({ message: (err as Error).message || 'Failed to update product.' })
+    res.status(500).json({ message: 'Failed to update product. Please try again.' })
   }
 })
 
@@ -229,13 +628,125 @@ router.patch('/:id/toggle', requireAuth, requireRole('admin'), async (req: Authe
 })
 
 /**
+ * POST /api/products/:id/image
+ * Upload or replace a menu item's photo (Admin only).
+ *
+ * The request body is the raw image bytes (`Content-Type: image/png` etc.)
+ * rather than multipart form data — a single file field does not justify a
+ * multipart parser. `express.json()` ignores non-JSON content types, so the
+ * buffer arrives intact.
+ */
+router.post('/:id/image', requireAuth, requireRole('admin'), rawImage, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const id = requireUuidParam(req, res)
+  if (!id) return
+
+  const image = readMenuImageUpload(req, res)
+  if (!image) return
+
+  try {
+    const { data: product, error: lookupErr } = await supabaseAdmin
+      .from('products')
+      .select('id, image_url')
+      .eq('id', id)
+      .maybeSingle()
+
+    if (lookupErr) throw lookupErr
+    if (!product) {
+      res.status(404).json({ message: 'Menu item not found.' })
+      return
+    }
+
+    const stored = await storeMenuImageObject(id, image.body, image.contentType, image.ext)
+    if ('error' in stored) {
+      res.status(500).json({ message: `Upload failed: ${stored.error}` })
+      return
+    }
+
+    const { data: updated, error: saveErr } = await supabaseAdmin
+      .from('products')
+      .update({ image_url: stored.url, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('*, category:product_categories(id, name, sort_order)')
+      .maybeSingle()
+
+    if (saveErr) throw saveErr
+    if (!updated) {
+      res.status(404).json({ message: 'Menu item not found.' })
+      return
+    }
+
+    // Only bin the previous file once the new URL is durably stored, and never
+    // delete the object we have just written.
+    if (product.image_url && product.image_url !== stored.url) {
+      await deleteMenuImageObject(product.image_url)
+    }
+
+    res.json(updated)
+  } catch (err: unknown) {
+    console.error('[Products] Failed to upload menu image:', err)
+    res.status(500).json({ message: 'Failed to upload the photo. Please try again.' })
+  }
+})
+
+/**
+ * DELETE /api/products/:id/image
+ * Remove a menu item's photo and return it to the placeholder (Admin only).
+ */
+router.delete('/:id/image', requireAuth, requireRole('admin'), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const id = requireUuidParam(req, res)
+  if (!id) return
+
+  try {
+    const { data: product, error: lookupErr } = await supabaseAdmin
+      .from('products')
+      .select('id, image_url')
+      .eq('id', id)
+      .maybeSingle()
+
+    if (lookupErr) throw lookupErr
+    if (!product) {
+      res.status(404).json({ message: 'Menu item not found.' })
+      return
+    }
+
+    const { data: updated, error: saveErr } = await supabaseAdmin
+      .from('products')
+      .update({ image_url: null, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('*, category:product_categories(id, name, sort_order)')
+      .maybeSingle()
+
+    if (saveErr) throw saveErr
+    if (!updated) {
+      res.status(404).json({ message: 'Menu item not found.' })
+      return
+    }
+
+    await deleteMenuImageObject(product.image_url)
+
+    res.json(updated)
+  } catch (err: unknown) {
+    console.error('[Products] Failed to remove menu image:', err)
+    res.status(500).json({ message: 'Failed to remove the photo. Please try again.' })
+  }
+})
+
+/**
  * DELETE /api/products/:id
  * Delete a product (Admin only).
  */
 router.delete('/:id', requireAuth, requireRole('admin'), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const { id } = req.params
+  const id = String(req.params.id ?? '')
 
   try {
+    // Read the photo first: once the row is gone there is nothing left to tell
+    // us which object in the bucket belonged to it.
+    const { data: doomed } = await supabaseAdmin
+      .from('products')
+      .select('image_url')
+      .eq('id', id)
+      .maybeSingle()
+
     // First remove recipe mappings
     await supabaseAdmin.from('product_recipes').delete().eq('product_id', id)
 
@@ -253,6 +764,9 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req: Authenticat
       }
       throw error
     }
+
+    // Best effort: a leftover object is untidy, not a reason to report failure.
+    await deleteMenuImageObject(doomed?.image_url)
 
     res.json({ message: 'Product deleted successfully.' })
   } catch (err: unknown) {

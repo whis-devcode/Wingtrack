@@ -2,11 +2,14 @@ import { useEffect, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '@/lib/supabase'
 import { apiCheckout } from '@/lib/api'
+import { dispatchNotification } from '@/lib/notifications'
 import { useAuth } from '@/hooks/useAuth'
 import type { Product, ProductCategory, CartItem, Order } from '@/types'
 import ReceiptModal from '@/components/receipt/ReceiptModal'
 import CashPaymentCalculator from '@/components/cashier/CashPaymentCalculator'
 import PayMongoModal from '@/components/cashier/PayMongoModal'
+import ConfirmDialog from '@/components/ui/ConfirmDialog'
+import FoodImage from '@/components/ui/FoodImage'
 
 const DEFAULT_CATS = ['All', 'Wings', 'Sizzling', 'Silog', 'Shake', 'Burger', 'Fries & Pure Cheesestick']
 
@@ -72,8 +75,14 @@ export default function PointOfSale() {
   const [showPayMongo, setShowPayMongo] = useState(false)
   const [lastCashReceived, setLastCashReceived] = useState<number | null>(null)
   const [lastChangeGiven, setLastChangeGiven] = useState<number | null>(null)
-  const [showVoidConfirm, setShowVoidConfirm] = useState(false)
-  const [mobileCartOpen, setMobileCartOpen] = useState(false)
+  /**
+   * Whether the mobile cart sheet is expanded.
+   *
+   * On narrow screens the cart lives in a bottom sheet instead of a side rail,
+   * so the checkout button stays within thumb reach no matter how long the
+   * product list is.
+   */
+  const [cartSheetOpen, setCartSheetOpen] = useState(false)
 
   const fetchProducts = useCallback(async () => {
     try {
@@ -210,6 +219,8 @@ export default function PointOfSale() {
   const subtotal = cart.reduce((s, c) => s + c.price * c.qty, 0)
   const vat      = Math.round(subtotal * 0.12 * 100) / 100
   const total    = Math.round((subtotal + vat) * 100) / 100
+  /** Total units in the cart (not the number of distinct lines). */
+  const cartCount = cart.reduce((s, c) => s + c.qty, 0)
 
   // When "Charge" is clicked: route to appropriate payment flow
   function handleChargeClick() {
@@ -269,6 +280,12 @@ export default function PointOfSale() {
         })),
       })
       setCheckoutSuccess(true)
+      // Broadcast new order notification to all windows (Dashboard receives this live)
+      dispatchNotification({
+        category: 'order',
+        title: 'New Order Placed',
+        body: `Order #${result.order_number} placed via ${method === 'online' ? 'card' : 'cash'}. Total: ₱${total.toFixed(2)}.`,
+      })
       setCart([])
       setNotes('')
     } catch (err: unknown) {
@@ -278,16 +295,11 @@ export default function PointOfSale() {
     }
   }
 
+  /** Whether the clear-cart confirmation is showing. */
+  const [showVoidConfirm, setShowVoidConfirm] = useState(false)
+
   function handleVoid() {
     setShowVoidConfirm(true)
-  }
-
-  function confirmVoid() {
-    setCart([])
-    setNotes('')
-    setError(null)
-    setShowVoidConfirm(false)
-    setMobileCartOpen(false)
   }
 
   function dismissSuccess() {
@@ -297,188 +309,138 @@ export default function PointOfSale() {
     setShowReceipt(false)
     setLastCashReceived(null)
     setLastChangeGiven(null)
-    setMobileCartOpen(false)
   }
 
   return (
-    <div style={{ display: 'flex', width: '100%', height: '100%', minHeight: '100%', maxHeight: '100dvh', overflow: 'hidden', position: 'relative' }}>
+    <div className="pos-shell">
       {/* Menu Panel */}
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 'clamp(14px, 2.5vw, 28px) clamp(14px, 2.5vw, 32px)' }}>
-          <div style={{ marginBottom: 18 }}>
-            <h1 style={{ fontFamily: 'Fraunces', fontSize: 'clamp(22px, 3vw, 30px)', fontWeight: 700, color: 'var(--foreground)', marginBottom: 4 }}>Point of Sale</h1>
-            <p style={{ fontSize: 13, color: 'var(--muted-foreground)' }}>
-              {new Date().toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })} · {profile?.full_name}
-            </p>
-          </div>
+      <div className="pos-menu">
+        <div style={{ marginBottom: 22 }}>
+          <p className="eyebrow" style={{ marginBottom: 6 }}>New Order</p>
+          <h1 className="page-title" style={{ fontSize: 30 }}>Point of Sale</h1>
+          <p className="page-subtitle" style={{ fontSize: 15 }}>
+            {new Date().toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })} · {profile?.full_name}
+          </p>
+        </div>
 
-          {/* Search & Category filter */}
-          <div style={{ display: 'flex', gap: 10, marginBottom: 18, alignItems: 'center', flexWrap: 'wrap' }}>
+        {/* Search & Category filter */}
+        <div style={{ display: 'flex', gap: 12, marginBottom: 22, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ position: 'relative', width: 230, maxWidth: '100%' }}>
+            <svg
+              width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+              style={{ position: 'absolute', left: 13, top: '50%', transform: 'translateY(-50%)', color: 'var(--muted-foreground)', pointerEvents: 'none' }}
+            >
+              <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
             <input
               id="pos-search"
               className="input"
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search products..."
-              style={{ width: '100%', maxWidth: 260, padding: '8px 14px', fontSize: 13 }}
+              aria-label="Search products"
+              style={{ width: '100%', padding: '9px 14px 9px 36px', fontSize: 13 }}
             />
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', overflowX: 'auto', paddingBottom: 2 }}>
-              {categories.map(c => (
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {categories.map(c => {
+              const active = cat === c
+              return (
                 <button
                   key={c}
                   id={`pos-cat-${c.toLowerCase()}`}
+                  aria-pressed={active}
                   onClick={() => setCat(c)}
                   style={{
-                    padding: '6px 14px', borderRadius: 24, fontSize: 12.5, fontWeight: 500, cursor: 'pointer',
-                    border: '1px solid var(--border)', transition: 'all 0.15s',
-                    background: cat === c ? 'var(--primary)' : 'var(--card)',
-                    color: cat === c ? 'var(--primary-foreground)' : 'var(--muted-foreground)',
-                    whiteSpace: 'nowrap',
+                    padding: '8px 18px', borderRadius: 24, fontSize: 13,
+                    fontWeight: active ? 600 : 500, cursor: 'pointer',
+                    border: '1px solid var(--border)',
+                    transition: 'all var(--t-fast) var(--ease)',
+                    background: active ? 'var(--primary)' : 'var(--card)',
+                    color: active ? 'var(--primary-foreground)' : 'var(--muted-foreground)',
+                    boxShadow: active ? 'var(--shadow-brand)' : 'var(--shadow-xs)',
                   }}
                 >
                   {c}
                 </button>
-              ))}
-            </div>
-          </div>
-
-          {loading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 60 }}>
-              <div className="spinner" style={{ width: 28, height: 28, borderWidth: 3 }} />
-            </div>
-          ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 'clamp(10px, 1.8vw, 16px)' }}>
-              {filtered.map(item => {
-                const inCart = cart.find(c => c.id === item.id)
-                const catName = (item.category as unknown as ProductCategory)?.name ?? ''
-                return (
-                  <button
-                    key={item.id}
-                    id={`pos-item-${item.id}`}
-                    onClick={() => addItem(item)}
-                    style={{
-                      background: inCart ? 'rgba(234,88,12,0.08)' : 'var(--card)',
-                      border: `1.5px solid ${inCart ? 'var(--primary)' : 'var(--border)'}`,
-                      borderRadius: 12, padding: 'clamp(12px, 2vw, 18px)', cursor: 'pointer', textAlign: 'left',
-                      transition: 'all 0.15s', display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
-                    }}
-                  >
-                    <div>
-                      <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginBottom: 6, fontFamily: 'DM Mono', textTransform: 'uppercase', letterSpacing: '0.06em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{catName}</p>
-                      <p style={{ fontSize: 'clamp(13px, 1.6vw, 16px)', fontWeight: 600, color: 'var(--foreground)', lineHeight: 1.25, marginBottom: 12 }}>{item.name}</p>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'auto', paddingTop: 6 }}>
-                      <span style={{ fontSize: 'clamp(14px, 1.8vw, 17px)', fontFamily: 'DM Mono', fontWeight: 700, color: 'var(--primary)' }}>&#8369;{Number(item.price).toFixed(2)}</span>
-                      {inCart && <span style={{ fontSize: 11, background: 'var(--primary)', color: 'var(--primary-foreground)', borderRadius: 10, padding: '2px 8px', fontWeight: 700 }}>x{inCart.qty}</span>}
-                    </div>
-                  </button>
-                )
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Mobile Floating / Sticky Cart Bar */}
-        <div className="lg:hidden shrink-0 px-3.5 py-2.5 bg-[var(--card)] border-t border-[var(--border)] shadow-lg z-20">
-          <div className="flex items-center justify-between gap-3 max-w-lg mx-auto">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="relative">
-                <span className="w-9 h-9 rounded-xl bg-orange-500/10 text-orange-600 flex items-center justify-center font-bold text-sm border border-orange-500/20">
-                  🛒
-                </span>
-                {cart.length > 0 && (
-                  <span className="absolute -top-1 -right-1 bg-red-600 text-white font-mono text-[10px] font-bold w-4 h-4 rounded-full flex items-center justify-center shadow-xs">
-                    {cart.reduce((s, i) => s + i.qty, 0)}
-                  </span>
-                )}
-              </div>
-              <div className="min-w-0">
-                <p className="text-[11px] text-[var(--muted-foreground)] font-medium leading-tight truncate">
-                  {cart.length === 0 ? 'Cart is empty' : `${cart.length} item${cart.length > 1 ? 's' : ''}`}
-                </p>
-                <p className="font-['Fraunces'] font-bold text-base text-[var(--foreground)] leading-tight">
-                  ₱{total.toLocaleString()}
-                </p>
-              </div>
-            </div>
-            <button
-              id="pos-mobile-cart-toggle"
-              onClick={() => setMobileCartOpen(true)}
-              className="btn-primary py-2 px-3.5 text-xs sm:text-sm font-semibold flex items-center gap-1.5 shadow-xs whitespace-nowrap"
-            >
-              {cart.length > 0 ? 'Checkout' : 'View Cart'}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="9 18 15 12 9 6"/>
-              </svg>
-            </button>
+              )
+            })}
           </div>
         </div>
+
+        {loading ? (
+          /* Skeleton tiles match the product card footprint so the grid does
+             not reflow when the menu arrives. */
+          <div aria-busy="true" aria-label="Loading menu" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16 }}>
+            {Array.from({ length: 8 }).map((_, i) => (
+              <div key={i} className="card" style={{ overflow: 'hidden' }}>
+                <div className="skeleton" style={{ height: 132, borderRadius: 0 }} />
+                <div style={{ padding: '16px 20px 20px' }}>
+                  <div className="skeleton" style={{ width: '45%', height: 11, marginBottom: 12 }} />
+                  <div className="skeleton" style={{ width: '80%', height: 16, marginBottom: 16 }} />
+                  <div className="skeleton" style={{ width: '38%', height: 17 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16 }}>
+            {filtered.map(item => {
+              const inCart = cart.find(c => c.id === item.id)
+              const catName = (item.category as unknown as ProductCategory)?.name ?? ''
+              return (
+                <button
+                  key={item.id}
+                  id={`pos-item-${item.id}`}
+                  className="pos-item"
+                  onClick={() => addItem(item)}
+                  style={{
+                    background: inCart ? 'rgba(234,88,12,0.08)' : 'var(--card)',
+                    border: `1px solid ${inCart ? 'var(--primary)' : 'var(--border)'}`,
+                    borderRadius: 14, padding: 0, cursor: 'pointer', textAlign: 'left',
+                    display: 'flex', flexDirection: 'column', overflow: 'hidden',
+                  }}
+                >
+                  {/* Photo banner. `overflow: hidden` on the button clips the
+                      top corners, so the image needs no radius of its own. */}
+                  <FoodImage name={item.name} src={item.image_url} height={132} />
+
+                  <div style={{ padding: '16px 20px 20px', display: 'flex', flexDirection: 'column', flex: 1 }}>
+                    <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 10, fontFamily: 'IBM Plex Mono', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{catName}</p>
+                    <p style={{ fontSize: 17, fontWeight: 600, color: 'var(--foreground)', lineHeight: 1.3, marginBottom: 14, flex: 1 }}>{item.name}</p>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: 18, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: 'var(--primary)' }}>&#8369;{Number(item.price).toFixed(2)}</span>
+                      {inCart && <span style={{ fontSize: 13, background: 'var(--primary)', color: 'var(--primary-foreground)', borderRadius: 12, padding: '4px 12px', fontWeight: 700 }}>x{inCart.qty}</span>}
+                    </div>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        )}
       </div>
 
-      {/* Mobile Cart Drawer Backdrop */}
-      {mobileCartOpen && (
-        <div
-          id="mobile-pos-cart-backdrop"
-          className="fixed inset-0 bg-black/60 backdrop-blur-xs z-40 lg:hidden transition-opacity"
-          onClick={() => setMobileCartOpen(false)}
-          aria-hidden="true"
-        />
-      )}
-
-      {/* Cart Panel (Drawer on <lg, permanent on lg+) */}
+      {/* Cart Panel */}
+      {/*
+        Layout (display/height/border) lives in `.pos-cart` in index.css, NOT in
+        an inline style — inline styles outrank media queries, which would stop
+        the ≤767px `display: none` rule from ever applying.
+      */}
       <div
-        className={`
-          fixed inset-y-0 right-0 z-50 w-full sm:w-[400px] max-w-full
-          lg:static lg:w-[380px] xl:w-[420px] lg:z-auto
-          transition-transform duration-300 ease-in-out shadow-2xl lg:shadow-none
-          ${mobileCartOpen ? 'translate-x-0' : 'translate-x-full lg:translate-x-0'}
-        `}
+        className="pos-cart"
         style={{
           background: 'var(--sidebar)',
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100%',
-          minHeight: '100%',
-          maxHeight: '100dvh',
-          borderLeft: '1px solid rgba(255,255,255,0.06)',
-          overflow: 'hidden',
-          flexShrink: 0,
         }}
       >
-        <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <button
-              id="close-mobile-cart-btn"
-              onClick={() => setMobileCartOpen(false)}
-              className="lg:hidden"
-              style={{
-                background: 'rgba(255,255,255,0.08)',
-                border: 'none',
-                color: 'var(--sidebar-muted)',
-                cursor: 'pointer',
-                padding: '6px 8px',
-                borderRadius: 6,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: 12,
-              }}
-              aria-label="Back to menu"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="19" y1="12" x2="5" y2="12"/>
-                <polyline points="12 19 5 12 12 5"/>
-              </svg>
-              Menu
-            </button>
-            <div>
-              <h2 style={{ fontFamily: 'Fraunces', fontSize: 18, fontWeight: 600, color: 'var(--sidebar-foreground)' }}>Current Order</h2>
-              <p style={{ fontSize: 12, color: 'var(--sidebar-muted)', marginTop: 1, fontFamily: 'DM Mono' }}>{cart.length} item{cart.length !== 1 ? 's' : ''}</p>
-            </div>
+        <div style={{ padding: '18px 20px', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+          <div>
+            <h2 style={{ fontFamily: 'Inter', fontSize: 20, fontWeight: 600, color: 'var(--sidebar-foreground)' }}>Current Order</h2>
+            <p style={{ fontSize: 13, color: 'var(--sidebar-muted)', marginTop: 2, fontFamily: 'IBM Plex Mono' }}>{cart.length} item{cart.length !== 1 ? 's' : ''}</p>
           </div>
-          <div style={{ textAlign: 'right', background: 'rgba(255,255,255,0.08)', padding: '6px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.14)' }}>
-            <span style={{ fontSize: 10, color: 'var(--sidebar-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', display: 'block', fontFamily: 'DM Mono', fontWeight: 500 }}>Cashier</span>
-            <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--sidebar-active)' }}>{profile?.full_name ?? 'Staff'}</span>
+          <div style={{ textAlign: 'right', background: 'rgba(255,255,255,0.08)', padding: '8px 14px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.14)' }}>
+            <span style={{ fontSize: 11, color: 'var(--sidebar-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', display: 'block', fontFamily: 'IBM Plex Mono', fontWeight: 500 }}>Cashier</span>
+            <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--sidebar-active)' }}>{profile?.full_name ?? 'Staff'}</span>
           </div>
         </div>
 
@@ -496,11 +458,11 @@ export default function PointOfSale() {
             <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 0', borderBottom: '1px solid rgba(255,255,255,0.07)' }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--sidebar-foreground)', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</p>
-                <p style={{ fontSize: 14, fontFamily: 'DM Mono', color: 'var(--sidebar-active)', marginTop: 3, fontWeight: 500 }}>&#8369;{(item.price * item.qty).toLocaleString()}</p>
+                <p style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', color: 'var(--sidebar-active)', marginTop: 3, fontWeight: 500 }}>&#8369;{(item.price * item.qty).toLocaleString()}</p>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <button id={`cart-dec-${item.id}`} onClick={() => updateQty(item.id, -1)} style={{ width: 28, height: 28, borderRadius: 6, border: '1px solid rgba(255,255,255,0.22)', background: 'rgba(255,255,255,0.05)', color: 'var(--sidebar-foreground)', fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>-</button>
-                <span style={{ fontSize: 14, fontFamily: 'DM Mono', color: 'var(--sidebar-foreground)', minWidth: 22, textAlign: 'center', fontWeight: 600 }}>{item.qty}</span>
+                <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', color: 'var(--sidebar-foreground)', minWidth: 22, textAlign: 'center', fontWeight: 600 }}>{item.qty}</span>
                 <button id={`cart-inc-${item.id}`} onClick={() => updateQty(item.id, 1)} style={{ width: 28, height: 28, borderRadius: 6, border: '1px solid rgba(255,255,255,0.22)', background: 'rgba(255,255,255,0.05)', color: 'var(--sidebar-foreground)', fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
                 <button
                   id={`cart-remove-${item.id}`}
@@ -534,13 +496,13 @@ export default function PointOfSale() {
             {[['Subtotal', `\u20B1${subtotal.toLocaleString()}`], ['VAT (12%)', `\u20B1${vat.toLocaleString()}`]].map(([k, v]) => (
               <div key={k} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
                 <span style={{ fontSize: 13, color: 'var(--sidebar-muted)' }}>{k}</span>
-                <span style={{ fontSize: 13, fontFamily: 'DM Mono', color: 'var(--sidebar-foreground)', fontWeight: 500 }}>{v}</span>
+                <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono', color: 'var(--sidebar-foreground)', fontWeight: 500 }}>{v}</span>
               </div>
             ))}
             <div style={{ height: 1, background: 'rgba(255,255,255,0.1)', margin: '10px 0' }} />
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ fontSize: 17, fontWeight: 700, color: 'var(--sidebar-foreground)', fontFamily: 'Fraunces' }}>Total</span>
-              <span style={{ fontSize: 19, fontFamily: 'DM Mono', fontWeight: 700, color: 'var(--sidebar-active)' }}>&#8369;{total.toLocaleString()}</span>
+              <span style={{ fontSize: 17, fontWeight: 700, color: 'var(--sidebar-foreground)', fontFamily: 'Inter' }}>Total</span>
+              <span style={{ fontSize: 19, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: 'var(--sidebar-active)' }}>&#8369;{total.toLocaleString()}</span>
             </div>
           </div>
 
@@ -557,7 +519,7 @@ export default function PointOfSale() {
               border: '1px solid rgba(255,255,255,0.15)',
               background: 'rgba(255,255,255,0.06)',
               color: 'var(--sidebar-foreground)',
-              fontSize: 13, fontFamily: 'DM Sans', outline: 'none',
+              fontSize: 13, fontFamily: 'Inter', outline: 'none',
             }}
           />
 
@@ -593,6 +555,7 @@ export default function PointOfSale() {
 
           <button
             id="btn-checkout"
+            className="pos-checkout"
             disabled={cart.length === 0 || checkoutLoading}
             onClick={handleChargeClick}
             style={{
@@ -600,7 +563,7 @@ export default function PointOfSale() {
               cursor: cart.length && !checkoutLoading ? 'pointer' : 'not-allowed',
               background: cart.length ? 'var(--sidebar-active)' : 'rgba(255,255,255,0.08)',
               color: cart.length ? '#1c0f06' : 'rgba(255,255,255,0.45)',
-              border: 'none', fontFamily: 'Fraunces', transition: 'all 0.15s',
+              border: 'none', fontFamily: 'Inter',
             }}
           >
             {checkoutLoading
@@ -623,6 +586,223 @@ export default function PointOfSale() {
           )}
         </div>
       </div>
+
+      {/* ── Mobile sticky cart bar ─────────────────────────────
+          Always visible at the bottom of the screen on narrow viewports, so
+          the cashier can reach checkout without scrolling past the menu.
+          Hidden on desktop, where the side rail is always in view. */}
+      <div className="pos-mobile-bar">
+        <button
+          type="button"
+          id="btn-mobile-cart"
+          onClick={() => setCartSheetOpen(true)}
+          style={{
+            flex: 1, display: 'flex', alignItems: 'center', gap: 12,
+            background: 'transparent', border: 'none', cursor: 'pointer',
+            padding: '4px 2px', textAlign: 'left', minWidth: 0,
+          }}
+        >
+          <span style={{ position: 'relative', display: 'flex', flexShrink: 0 }}>
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="var(--sidebar-foreground)" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="9" cy="21" r="1" /><circle cx="20" cy="21" r="1" />
+              <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
+            </svg>
+            {cartCount > 0 && (
+              <span
+                style={{
+                  position: 'absolute', top: -5, right: -7,
+                  minWidth: 18, height: 18, padding: '0 5px',
+                  borderRadius: 9, background: 'var(--sidebar-active)', color: '#1c0f06',
+                  fontSize: 11, fontWeight: 700, fontFamily: 'IBM Plex Mono',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}
+              >
+                {cartCount}
+              </span>
+            )}
+          </span>
+          <span style={{ minWidth: 0 }}>
+            <span style={{ display: 'block', fontSize: 12, color: 'var(--sidebar-muted)', fontFamily: 'IBM Plex Mono', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              {cartCount === 0 ? 'Cart empty' : `${cartCount} item${cartCount === 1 ? '' : 's'}`}
+            </span>
+            <span style={{ display: 'block', fontSize: 17, fontWeight: 700, color: 'var(--sidebar-active)', fontFamily: 'IBM Plex Mono', lineHeight: 1.25 }}>
+              &#8369;{total.toLocaleString()}
+            </span>
+          </span>
+        </button>
+
+        <button
+          type="button"
+          id="btn-mobile-checkout"
+          disabled={cartCount === 0 || checkoutLoading}
+          onClick={() => (cartCount === 0 ? setCartSheetOpen(true) : handleChargeClick())}
+          style={{
+            flexShrink: 0, padding: '13px 22px', borderRadius: 9, border: 'none',
+            fontSize: 15, fontWeight: 700, fontFamily: 'Inter',
+            cursor: cartCount === 0 || checkoutLoading ? 'not-allowed' : 'pointer',
+            background: cartCount ? 'var(--sidebar-active)' : 'rgba(255,255,255,0.08)',
+            color: cartCount ? '#1c0f06' : 'rgba(255,255,255,0.45)',
+            transition: 'all 0.15s',
+          }}
+        >
+          {checkoutLoading ? 'Processing…' : cartCount === 0 ? 'View cart' : 'Charge'}
+        </button>
+      </div>
+
+      {/* ── Mobile cart sheet ─────────────────────────────────
+          Full cart contents, notes and payment method, presented as a
+          bottom sheet so nothing needs its own scroll to reach. */}
+      {cartSheetOpen && createPortal(
+        <div
+          className="pos-sheet-backdrop"
+          onClick={e => { if (e.target === e.currentTarget) setCartSheetOpen(false) }}
+        >
+          <div className="pos-sheet" role="dialog" aria-modal="true" aria-label="Current order">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 18px', borderBottom: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
+              <div>
+                <h2 style={{ fontFamily: 'Inter', fontSize: 19, fontWeight: 600, color: 'var(--sidebar-foreground)' }}>Current Order</h2>
+                <p style={{ fontSize: 12.5, color: 'var(--sidebar-muted)', marginTop: 2, fontFamily: 'IBM Plex Mono' }}>
+                  {cartCount} item{cartCount === 1 ? '' : 's'} · &#8369;{total.toLocaleString()}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCartSheetOpen(false)}
+                aria-label="Close cart"
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--sidebar-muted)', padding: 8, display: 'flex' }}
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Cart lines — the only scrolling region in the sheet */}
+            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '8px 18px' }}>
+              {cartCount === 0 ? (
+                <div style={{ textAlign: 'center', padding: '44px 20px', color: 'var(--sidebar-muted)' }}>
+                  <p style={{ fontSize: 15, fontWeight: 500, color: 'var(--sidebar-foreground)' }}>No items yet</p>
+                  <p style={{ fontSize: 13, marginTop: 5 }}>Tap menu items to add them</p>
+                </div>
+              ) : cart.map(item => (
+                <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 0', borderBottom: '1px solid rgba(255,255,255,0.07)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--sidebar-foreground)', lineHeight: 1.3 }}>{item.name}</p>
+                    <p style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', color: 'var(--sidebar-active)', marginTop: 3, fontWeight: 500 }}>&#8369;{(item.price * item.qty).toLocaleString()}</p>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <button type="button" onClick={() => updateQty(item.id, -1)} aria-label={`Decrease ${item.name}`} style={{ width: 30, height: 30, borderRadius: 6, border: '1px solid rgba(255,255,255,0.22)', background: 'rgba(255,255,255,0.05)', color: 'var(--sidebar-foreground)', fontSize: 17, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>-</button>
+                    <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', color: 'var(--sidebar-foreground)', minWidth: 22, textAlign: 'center', fontWeight: 600 }}>{item.qty}</span>
+                    <button type="button" onClick={() => updateQty(item.id, 1)} aria-label={`Increase ${item.name}`} style={{ width: 30, height: 30, borderRadius: 6, border: '1px solid rgba(255,255,255,0.22)', background: 'rgba(255,255,255,0.05)', color: 'var(--sidebar-foreground)', fontSize: 17, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
+                    <button type="button" onClick={() => removeItem(item.id)} aria-label={`Remove ${item.name}`} style={{ width: 30, height: 30, borderRadius: 6, border: '1px solid rgba(252,165,165,0.3)', background: 'transparent', color: '#fca5a5', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', marginLeft: 2 }}>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                        <path d="M10 11v6M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Totals + payment + checkout — pinned to the bottom of the sheet */}
+            <div style={{ padding: '14px 18px calc(16px + env(safe-area-inset-bottom, 0px))', borderTop: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
+              {error && (
+                <div style={{ background: 'rgba(185,28,28,0.25)', border: '1px solid rgba(185,28,28,0.5)', borderRadius: 6, padding: '8px 12px', fontSize: 12, color: '#fca5a5', marginBottom: 10 }}>
+                  {error}
+                </div>
+              )}
+
+              <div style={{ marginBottom: 12 }}>
+                {[['Subtotal', `\u20B1${subtotal.toLocaleString()}`], ['VAT (12%)', `\u20B1${vat.toLocaleString()}`]].map(([k, v]) => (
+                  <div key={k} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+                    <span style={{ fontSize: 13, color: 'var(--sidebar-muted)' }}>{k}</span>
+                    <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono', color: 'var(--sidebar-foreground)', fontWeight: 500 }}>{v}</span>
+                  </div>
+                ))}
+                <div style={{ height: 1, background: 'rgba(255,255,255,0.1)', margin: '10px 0' }} />
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 17, fontWeight: 700, color: 'var(--sidebar-foreground)', fontFamily: 'Inter' }}>Total</span>
+                  <span style={{ fontSize: 19, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: 'var(--sidebar-active)' }}>&#8369;{total.toLocaleString()}</span>
+                </div>
+              </div>
+
+              <textarea
+                className="sidebar-textarea"
+                placeholder="Order notes (optional)..."
+                value={notes}
+                onChange={e => setNotes(e.target.value)}
+                rows={1}
+                style={{
+                  width: '100%', resize: 'none', marginBottom: 12,
+                  padding: '10px 12px', borderRadius: 6, height: 40,
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  background: 'rgba(255,255,255,0.06)',
+                  color: 'var(--sidebar-foreground)',
+                  fontSize: 16, fontFamily: 'Inter', outline: 'none',
+                }}
+              />
+
+              <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                <button
+                  type="button"
+                  onClick={() => setMethod('cash')}
+                  style={{
+                    flex: 1, padding: '11px 4px', borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: 'pointer',
+                    border: `1px solid ${method === 'cash' ? 'var(--sidebar-active)' : 'rgba(255,255,255,0.18)'}`,
+                    background: method === 'cash' ? 'rgba(240,155,58,0.22)' : 'rgba(255,255,255,0.04)',
+                    color: method === 'cash' ? 'var(--sidebar-active)' : 'var(--sidebar-muted)',
+                  }}
+                >
+                  Cash
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMethod('online')}
+                  style={{
+                    flex: 1, padding: '11px 4px', borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: 'pointer',
+                    border: `1px solid ${method === 'online' ? '#818cf8' : 'rgba(255,255,255,0.18)'}`,
+                    background: method === 'online' ? 'rgba(99,102,241,0.22)' : 'rgba(255,255,255,0.04)',
+                    color: method === 'online' ? '#a5b4fc' : 'var(--sidebar-muted)',
+                  }}
+                >
+                  Online
+                </button>
+              </div>
+
+              <button
+                type="button"
+                disabled={cartCount === 0 || checkoutLoading}
+                onClick={() => { setCartSheetOpen(false); handleChargeClick() }}
+                style={{
+                  width: '100%', padding: '15px', borderRadius: 8, fontSize: 16, fontWeight: 700,
+                  cursor: cartCount && !checkoutLoading ? 'pointer' : 'not-allowed',
+                  background: cartCount ? 'var(--sidebar-active)' : 'rgba(255,255,255,0.08)',
+                  color: cartCount ? '#1c0f06' : 'rgba(255,255,255,0.45)',
+                  border: 'none', fontFamily: 'Inter', transition: 'all 0.15s',
+                }}
+              >
+                {checkoutLoading
+                  ? 'Processing...'
+                  : cartCount
+                  ? `Charge \u20B1${total.toLocaleString()}`
+                  : 'Add items to continue'}
+              </button>
+
+              {cartCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => { setCartSheetOpen(false); handleVoid() }}
+                  style={{ width: '100%', marginTop: 8, padding: '11px', background: 'transparent', border: '1px solid rgba(255,255,255,0.14)', borderRadius: 6, fontSize: 13.5, color: 'var(--sidebar-muted)', cursor: 'pointer' }}
+                >
+                  Void Order
+                </button>
+              )}
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
 
       {/* Success Modal — rendered via portal to escape transform containing block */}
       {checkoutSuccess && createPortal(
@@ -649,17 +829,17 @@ export default function PointOfSale() {
                 <polyline points="20 6 9 17 4 12"/>
               </svg>
             </div>
-            <h2 style={{ fontFamily: 'Fraunces', fontSize: 22, fontWeight: 700, color: 'var(--foreground)', marginBottom: 8 }}>Payment Received</h2>
+            <h2 style={{ fontFamily: 'Inter', fontSize: 22, fontWeight: 700, color: 'var(--foreground)', marginBottom: 8 }}>Payment Received</h2>
             <p style={{ fontSize: 14, color: 'var(--muted-foreground)', marginBottom: 4 }}>Order #{orderNum} completed</p>
             {lastCashReceived !== null && lastChangeGiven !== null && (
               <div style={{ background: 'var(--muted)', borderRadius: 10, padding: '14px 18px', margin: '14px 0', textAlign: 'left' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                   <span style={{ fontSize: 13, color: 'var(--muted-foreground)' }}>Cash Received</span>
-                  <span style={{ fontSize: 14, fontFamily: 'DM Mono', fontWeight: 600, color: 'var(--foreground)' }}>₱{lastCashReceived.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                  <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', fontWeight: 600, color: 'var(--foreground)' }}>₱{lastCashReceived.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span style={{ fontSize: 13, color: 'var(--muted-foreground)' }}>Change Given</span>
-                  <span style={{ fontSize: 14, fontFamily: 'DM Mono', fontWeight: 700, color: lastChangeGiven > 0 ? 'var(--success)' : 'var(--foreground)' }}>₱{lastChangeGiven.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                  <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: lastChangeGiven > 0 ? 'var(--success)' : 'var(--foreground)' }}>₱{lastChangeGiven.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                 </div>
               </div>
             )}
@@ -684,54 +864,6 @@ export default function PointOfSale() {
               </button>
               <button id="btn-new-order" className="btn-primary" onClick={dismissSuccess} style={{ width: '100%', padding: '13px', fontSize: 15 }}>
                 New Order
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
-
-      {/* Void Confirmation Modal */}
-      {showVoidConfirm && createPortal(
-        <div
-          style={{
-            position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
-            background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)',
-            WebkitBackdropFilter: 'blur(4px)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10001,
-          }}
-          onClick={e => { if (e.target === e.currentTarget) setShowVoidConfirm(false) }}
-        >
-          <div className="card fade-in" style={{ padding: '32px 28px', maxWidth: 380, width: '90%', textAlign: 'center', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
-            <div style={{ width: 54, height: 54, borderRadius: '50%', background: 'rgba(185,28,28,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#b91c1c" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="3 6 5 6 21 6"/>
-                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                <path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
-              </svg>
-            </div>
-            <h2 style={{ fontFamily: 'Fraunces', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 8 }}>Void Order?</h2>
-            <p style={{ fontSize: 14, color: 'var(--muted-foreground)', marginBottom: 22, lineHeight: 1.6 }}>
-              This will clear all <strong>{cart.length} item{cart.length !== 1 ? 's' : ''}</strong> from the current order. This action cannot be undone.
-            </p>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button
-                id="btn-void-cancel"
-                className="btn-ghost"
-                onClick={() => setShowVoidConfirm(false)}
-                style={{ flex: 1, padding: '12px' }}
-              >
-                Cancel
-              </button>
-              <button
-                id="btn-void-confirm"
-                onClick={confirmVoid}
-                style={{
-                  flex: 1, padding: '12px', borderRadius: 8, fontSize: 14, fontWeight: 700,
-                  background: '#b91c1c', color: '#fff', border: 'none', cursor: 'pointer',
-                }}
-              >
-                Yes, Void Order
               </button>
             </div>
           </div>
@@ -769,6 +901,17 @@ export default function PointOfSale() {
       {showReceipt && completedOrder && (
         <ReceiptModal order={completedOrder} onClose={() => setShowReceipt(false)} />
       )}
+
+      {/* Clear cart confirmation */}
+      <ConfirmDialog
+        open={showVoidConfirm}
+        tone="danger"
+        title="Clear this order?"
+        message={`All ${cart.length} item${cart.length !== 1 ? 's' : ''} will be removed from the current cart. Nothing is charged, and inventory is not affected.`}
+        confirmLabel="Clear cart"
+        onConfirm={() => { setCart([]); setShowVoidConfirm(false) }}
+        onCancel={() => setShowVoidConfirm(false)}
+      />
     </div>
   )
 }

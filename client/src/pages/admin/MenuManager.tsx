@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import {
   apiGetProducts,
@@ -8,16 +8,333 @@ import {
   apiUpdateProduct,
   apiToggleProductAvailability,
   apiDeleteProduct,
+  apiUploadProductImage,
+  apiRemoveProductImage,
 } from '@/lib/api'
 import { supabase } from '@/lib/supabase'
-import type { Product, ProductCategory, InventoryItem } from '@/types'
+import { dispatchNotification } from '@/lib/notifications'
+import { useIsCompact } from '@/hooks/useMediaQuery'
+import ConfirmDialog from '@/components/ui/ConfirmDialog'
+import FoodImage from '@/components/ui/FoodImage'
+import type { Product, ProductCategory, InventoryItem, ProductRecipe } from '@/types'
+
+/** Badge styling per product type, shared by the table row and the mobile card. */
+export const TYPE_CONFIG: Record<string, { label: string; bg: string; color: string; border: string }> = {
+  Regular:    { label: 'Regular',    bg: 'rgba(100,116,139,0.12)', color: '#475569', border: '1px solid rgba(100,116,139,0.25)' },
+  Bestseller: { label: 'Bestseller', bg: '#fff7e6', color: '#b45309', border: '1px solid #fde68a' },
+  New:        { label: 'New',        bg: '#e8f5e9', color: '#15803d', border: '1px solid #bbf7d0' },
+  Seasonal:   { label: 'Seasonal',   bg: '#fce8e8', color: '#b91c1c', border: '1px solid #fecaca' },
+  Special:    { label: 'Special',    bg: '#f0f4ff', color: '#4338ca', border: '1px solid #c7d2fe' },
+}
+
+/**
+ * Calculates profit margin and returns badge styling based on margin health.
+ */
+export function getMarginInfo(price: number, cost: number) {
+  const p = Number(price) || 0
+  const c = Number(cost) || 0
+  if (p <= 0) {
+    return {
+      pct: 0,
+      profit: 0,
+      label: '—',
+      bg: 'rgba(100,116,139,0.08)',
+      color: 'var(--muted-foreground)',
+      border: '1px solid rgba(100,116,139,0.18)',
+    }
+  }
+  const profit = p - c
+  const pct = (profit / p) * 100
+  if (pct < 0) {
+    return {
+      pct,
+      profit,
+      label: `${pct.toFixed(1)}%`,
+      bg: '#fee2e2',
+      color: '#b91c1c',
+      border: '1px solid #fca5a5',
+    }
+  }
+  if (pct < 20) {
+    return {
+      pct,
+      profit,
+      label: `+${pct.toFixed(1)}%`,
+      bg: '#fff7ed',
+      color: '#c2410c',
+      border: '1px solid #ffedd5',
+    }
+  }
+  if (pct < 50) {
+    return {
+      pct,
+      profit,
+      label: `+${pct.toFixed(1)}%`,
+      bg: '#eff6ff',
+      color: '#1d4ed8',
+      border: '1px solid #bfdbfe',
+    }
+  }
+  return {
+    pct,
+    profit,
+    label: `+${pct.toFixed(1)}%`,
+    bg: '#e8f5e9',
+    color: '#15803d',
+    border: '1px solid #bbf7d0',
+  }
+}
+
+/** Pre-defined category list for dropdown selection when creating a category. */
+export const PRESET_CATEGORIES = [
+  'Wings',
+  'Boneless Wings',
+  'Flavored Wings',
+  'Chicken Tenders',
+  'Combos',
+  'Platters & Bundles',
+  'Rice Bowls',
+  'Sides & Fries',
+  'Dips, Sauces & Glazes',
+  'Drinks & Beverages',
+  'Milkshakes & Floats',
+  'Desserts',
+  'Appetizers',
+  'Burgers & Sandwiches',
+  'Salads',
+  'Seasonal Specials',
+  'Party Packs',
+  'Add-ons & Extras',
+]
+
+/** How many ingredients a collapsed recipe shows before offering to expand. */
+const RECIPE_PREVIEW_LIMIT = 3
+
+/** Trims a stored quantity to at most two decimals, dropping trailing zeros. */
+function formatQty(qty: number): string {
+  if (!Number.isFinite(qty)) return '—'
+  return String(Math.round(qty * 100) / 100)
+}
+
+/**
+ * Readable rendering of a dish's linked inventory.
+ *
+ * Each ingredient is one line in a two-column block: the name on the left, the
+ * quantity on the right in tabular figures so the numbers line up down the
+ * list. Longer recipes collapse to `RECIPE_PREVIEW_LIMIT` lines behind a
+ * "+N more" toggle — a six-ingredient dish used to render as six stacked chips
+ * and stretch its table row to roughly three times the height of its
+ * neighbours, which made the whole list hard to scan.
+ */
+function RecipeList({ recipes }: { recipes: ProductRecipe[] }) {
+  const [expanded, setExpanded] = useState(false)
+  const collapsible = recipes.length > RECIPE_PREVIEW_LIMIT
+  const shown = expanded || !collapsible ? recipes : recipes.slice(0, RECIPE_PREVIEW_LIMIT)
+  const hidden = recipes.length - shown.length
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', maxWidth: 320 }}>
+      {shown.map((r, i) => (
+        <div
+          key={r.id ?? `${r.inventory_id}-${i}`}
+          style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            justifyContent: 'space-between',
+            gap: 14,
+            padding: '5px 0',
+            borderTop: i === 0 ? 'none' : '1px solid var(--border)',
+          }}
+        >
+          <span
+            title={r.inventory?.name ?? 'Item'}
+            style={{
+              fontSize: 12.5,
+              color: 'var(--foreground)',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {r.inventory?.name ?? 'Item'}
+          </span>
+          <span
+            style={{
+              fontSize: 12.5,
+              fontFamily: 'var(--font-mono)',
+              fontVariantNumeric: 'tabular-nums',
+              color: 'var(--muted-foreground)',
+              whiteSpace: 'nowrap',
+              flexShrink: 0,
+            }}
+          >
+            <span style={{ color: 'var(--foreground)', fontWeight: 600 }}>{formatQty(r.qty_per_unit)}</span>
+            {r.inventory?.unit ? ` ${r.inventory.unit}` : ''}
+          </span>
+        </div>
+      ))}
+
+      {collapsible && (
+        <button
+          type="button"
+          onClick={() => setExpanded(v => !v)}
+          aria-expanded={expanded}
+          style={{
+            alignSelf: 'flex-start',
+            marginTop: 7,
+            padding: 0,
+            background: 'none',
+            border: 'none',
+            cursor: 'pointer',
+            fontSize: 11.5,
+            fontWeight: 600,
+            color: 'var(--primary)',
+          }}
+        >
+          {expanded ? 'Show less' : `+${hidden} more`}
+        </button>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Phone-width presentation of a menu item. Mirrors every column the desktop
+ * table shows: name, type, category, price, linked recipe, POS status, actions.
+ */
+function MenuCard({
+  prod,
+  onEdit,
+  onDelete,
+  onToggle,
+}: {
+  prod: Product
+  onEdit: () => void
+  onDelete: () => void
+  onToggle: () => void
+}) {
+  const catName = (prod.category as ProductCategory | undefined)?.name ?? '—'
+  const recipes = prod.recipes ?? []
+  const prodType = prod.product_type ?? 'Regular'
+  const tc = TYPE_CONFIG[prodType] ?? TYPE_CONFIG.Regular
+  const margin = getMarginInfo(prod.price, prod.unit_cost ?? 0)
+
+  return (
+    <div className="card" style={{ padding: '14px 16px', opacity: prod.is_available ? 1 : 0.65 }}>
+      {/* Photo + name + type badge */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 10 }}>
+        <div style={{ width: 52, flexShrink: 0 }}>
+          <FoodImage name={prod.name} src={prod.image_url} height={52} radius={8} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+            <span style={{ fontWeight: 600, fontSize: 15, color: 'var(--foreground)', minWidth: 0, overflowWrap: 'anywhere' }}>
+              {prod.name}
+            </span>
+            <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 12, background: tc.bg, color: tc.color, border: tc.border, fontWeight: 700, whiteSpace: 'nowrap', flexShrink: 0 }}>
+              {tc.label}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Category + price + cost */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 8 }}>
+        <span
+          style={{
+            padding: '4px 10px', borderRadius: 12, fontSize: 12, fontWeight: 500,
+            background: 'rgba(155,94,40,0.1)', color: 'var(--primary)', fontFamily: 'IBM Plex Mono',
+          }}
+        >
+          {catName}
+        </span>
+        <div style={{ textAlign: 'right' }}>
+          <span style={{ fontFamily: 'IBM Plex Mono', fontWeight: 700, fontSize: 16, color: 'var(--foreground)' }}>
+            &#8369;{Number(prod.price).toFixed(2)}
+          </span>
+          <div style={{ fontSize: 11, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono' }}>
+            Cost: &#8369;{Number(prod.unit_cost || 0).toFixed(2)}
+          </div>
+        </div>
+      </div>
+
+      {/* Margin indicator */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', background: margin.bg, border: margin.border, borderRadius: 6, marginBottom: 12 }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: margin.color }}>
+          Profit Margin
+        </span>
+        <span style={{ fontSize: 12, fontWeight: 700, fontFamily: 'IBM Plex Mono', color: margin.color }}>
+          {margin.label} ({margin.profit >= 0 ? '+' : ''}&#8369;{margin.profit.toFixed(2)}/unit)
+        </span>
+      </div>
+
+      {/* Linked recipe */}
+      <p style={{ fontSize: 10, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+        Inventory Recipe
+      </p>
+      {recipes.length === 0 ? (
+        <p style={{ fontSize: 12, color: 'var(--muted-foreground)', fontStyle: 'italic', marginBottom: 12 }}>
+          None linked
+        </p>
+      ) : (
+        <div style={{ marginBottom: 12 }}>
+          <RecipeList recipes={recipes} />
+        </div>
+      )}
+
+      {/* POS status */}
+      <button
+        type="button"
+        onClick={onToggle}
+        style={{
+          width: '100%', padding: '9px 12px', borderRadius: 8, fontSize: 13, fontWeight: 600,
+          cursor: 'pointer', border: 'none', marginBottom: 10,
+          background: prod.is_available ? '#e8f5e9' : '#fee2e2',
+          color: prod.is_available ? '#15803d' : '#991b1b',
+        }}
+      >
+        {prod.is_available ? 'In Stock' : 'Out of Stock'}
+      </button>
+
+      {/* Actions */}
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button
+          type="button"
+          onClick={onEdit}
+          className="btn-ghost"
+          style={{ flex: 1, padding: '9px 12px', fontSize: 13, borderRadius: 8 }}
+        >
+          Edit
+        </button>
+        <button
+          type="button"
+          onClick={onDelete}
+          style={{
+            flex: 1, padding: '9px 12px', fontSize: 13, borderRadius: 8,
+            border: '1px solid #fee2e2', background: '#fff5f5', color: '#b91c1c',
+            cursor: 'pointer', fontWeight: 600,
+          }}
+        >
+          Delete
+        </button>
+      </div>
+    </div>
+  )
+}
 
 interface RecipeRow {
   inventory_id: string
   qty_per_unit: number | string
 }
 
+/** Accepted photo types — must match MENU_IMAGE_MIME on the server. */
+const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
 export default function MenuManager() {
+  /** Phones get a card list; wider viewports keep the table. */
+  const isCompact = useIsCompact()
   const [products, setProducts] = useState<Product[]>([])
   const [categories, setCategories] = useState<ProductCategory[]>([])
   const [inventoryList, setInventoryList] = useState<InventoryItem[]>([])
@@ -29,20 +346,44 @@ export default function MenuManager() {
   const [showItemModal, setShowItemModal] = useState(false)
   const [editingProduct, setEditingProduct] = useState<Product | null>(null)
   const [showCategoryModal, setShowCategoryModal] = useState(false)
-  const [deleteConfirm, setDeleteConfirm] = useState<Product | null>(null)
 
   // Item form state
   const [formName, setFormName] = useState('')
   const [formType, setFormType] = useState('Regular')
   const [formCatId, setFormCatId] = useState('')
   const [formPrice, setFormPrice] = useState('')
+  const [formCost, setFormCost] = useState('')
+  /** True when the user has manually typed a cost — stops recipe auto-fill from overwriting it. */
+  const [costManuallySet, setCostManuallySet] = useState(false)
   const [formAvailable, setFormAvailable] = useState(true)
   const [formRecipes, setFormRecipes] = useState<RecipeRow[]>([])
   const [formLoading, setFormLoading] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
 
+  /**
+   * Photo state for the item form.
+   *
+   * Three separate things, because the photo can be in three different states:
+   *
+   *   formImageUrl     — the URL already saved on the product (edit only)
+   *   formImageFile    — a file the user has just picked, not uploaded yet
+   *   formImagePreview — an object URL for that file, so the tile updates
+   *                      instantly instead of after a round trip
+   *
+   * Nothing is uploaded until the form is submitted, so a cancelled edit
+   * leaves no orphaned object in the bucket.
+   */
+  const [formImageUrl, setFormImageUrl] = useState<string | null>(null)
+  const [formImageFile, setFormImageFile] = useState<File | null>(null)
+  const [formImagePreview, setFormImagePreview] = useState<string | null>(null)
+  /** True when an existing photo should be deleted on save. */
+  const [formImageRemoved, setFormImageRemoved] = useState(false)
+  const [formImageError, setFormImageError] = useState<string | null>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
+
   // Category form state
   const [newCatName, setNewCatName] = useState('')
+  const [selectedPresetCategory, setSelectedPresetCategory] = useState('')
   const [catLoading, setCatLoading] = useState(false)
   const [catError, setCatError] = useState<string | null>(null)
 
@@ -65,29 +406,59 @@ export default function MenuManager() {
   }, [showItemModal, showCategoryModal])
 
   const loadData = useCallback(async () => {
-    try {
-      const [prods, cats, invRes] = await Promise.all([
-        apiGetProducts(),
-        apiGetCategories(),
-        supabase.from('inventory').select('id, name, unit, stock_qty').order('name'),
-      ])
+    setLoading(true)
+    // Settle each source independently: a failure in one used to blank the
+    // whole page because Promise.all rejects on the first error. Now the
+    // products/categories are what the page is actually for, and the recipe
+    // picker degrades to an empty list if inventory can't be read.
+    const [prodsRes, catsRes, invRes] = await Promise.allSettled([
+      apiGetProducts(),
+      apiGetCategories(),
+      supabase.from('inventory').select('id, name, unit, stock_qty, unit_cost').order('name'),
+    ])
 
-      setProducts(prods)
-      setCategories(cats)
-      if (invRes.data) {
-        setInventoryList(invRes.data as InventoryItem[])
+    const criticalFailure =
+      prodsRes.status === 'rejected' || catsRes.status === 'rejected'
+
+    if (prodsRes.status === 'fulfilled') setProducts(prodsRes.value)
+    if (catsRes.status === 'fulfilled') setCategories(catsRes.value)
+
+    if (invRes.status === 'fulfilled') {
+      if (invRes.value.error) {
+        console.warn('Inventory lookup failed (recipe picker will be empty):', invRes.value.error.message)
+      } else if (invRes.value.data) {
+        setInventoryList(invRes.value.data as InventoryItem[])
       }
-    } catch (err: unknown) {
-      console.error('Failed to load menu data:', err)
-      showBanner('error', 'Failed to load menu data')
-    } finally {
-      setLoading(false)
+    } else {
+      console.warn('Inventory lookup failed (recipe picker will be empty):', invRes.reason)
     }
+
+    if (criticalFailure) {
+      const reason = prodsRes.status === 'rejected' ? prodsRes.reason : (catsRes as PromiseRejectedResult).reason
+      console.error('Failed to load menu data:', reason)
+      showBanner('error', reason instanceof Error ? reason.message : 'Failed to load menu data')
+    }
+
+    setLoading(false)
   }, [])
 
   useEffect(() => {
     loadData()
   }, [loadData])
+
+  // Auto-fill Unit Cost from recipe ingredient costs whenever recipes change
+  useEffect(() => {
+    if (costManuallySet) return
+    const total = formRecipes.reduce((sum, row) => {
+      const inv = inventoryList.find(i => i.id === row.inventory_id)
+      const qty = Number(row.qty_per_unit) || 0
+      const cost = Number(inv?.unit_cost) || 0
+      return sum + qty * cost
+    }, 0)
+    if (total > 0) {
+      setFormCost(total.toFixed(2))
+    }
+  }, [formRecipes, inventoryList, costManuallySet])
 
   function openCreateModal() {
     setEditingProduct(null)
@@ -95,19 +466,26 @@ export default function MenuManager() {
     setFormType('Regular')
     setFormCatId(categories[0]?.id || '')
     setFormPrice('')
+    setFormCost('')
     setFormAvailable(true)
     setFormRecipes([])
     setFormError(null)
+    setCostManuallySet(false)
+    resetImageState(null)
+    setSelectedPresetCategory('')
+    setNewCatName('')
     setShowItemModal(true)
   }
 
   function openEditModal(prod: Product) {
     setEditingProduct(prod)
     setFormName(prod.name)
-    setFormType((prod as Product & { product_type?: string }).product_type ?? 'Regular')
+    setFormType(prod.product_type ?? 'Regular')
     setFormCatId(prod.category_id)
     setFormPrice(String(prod.price))
+    setFormCost(prod.unit_cost != null && prod.unit_cost > 0 ? String(prod.unit_cost) : (prod.unit_cost === 0 ? '0' : ''))
     setFormAvailable(prod.is_available)
+    setCostManuallySet(prod.unit_cost != null && prod.unit_cost > 0)
     setFormRecipes(
       prod.recipes?.map(r => ({
         inventory_id: r.inventory_id,
@@ -115,6 +493,9 @@ export default function MenuManager() {
       })) || []
     )
     setFormError(null)
+    // Seeds the tile with the photo already on the item, so editing starts from
+    // what is actually stored rather than an empty box.
+    resetImageState(prod.image_url ?? null)
     setShowItemModal(true)
   }
 
@@ -134,6 +515,72 @@ export default function MenuManager() {
   function removeRecipeRow(index: number) {
     setFormRecipes(prev => prev.filter((_, i) => i !== index))
   }
+
+  // ── Photo handling ────────────────────────────────────────
+  /*
+   * An object URL is a live handle on a blob, not a string that can simply be
+   * dropped — the browser holds the file in memory until it is released. One
+   * ref tracks whichever URL is currently live so every replacement (and the
+   * unmount) can revoke the previous one.
+   */
+  const previewUrlRef = useRef<string | null>(null)
+
+  useEffect(() => () => {
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
+  }, [])
+
+  /** Points the preview at a file, releasing whatever it showed before. */
+  function showPreviewFor(file: File | null) {
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current)
+      previewUrlRef.current = null
+    }
+    const url = file ? URL.createObjectURL(file) : null
+    previewUrlRef.current = url
+    setFormImagePreview(url)
+  }
+
+  function resetImageState(savedUrl: string | null) {
+    showPreviewFor(null)
+    setFormImageUrl(savedUrl)
+    setFormImageFile(null)
+    setFormImageRemoved(false)
+    setFormImageError(null)
+    if (imageInputRef.current) imageInputRef.current.value = ''
+  }
+
+  function handlePickImage(file: File | null | undefined) {
+    if (!file) return
+
+    if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+      setFormImageError('Only JPG, PNG or WebP images are supported.')
+      return
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      setFormImageError('That image is larger than 5 MB. Please choose a smaller one.')
+      return
+    }
+
+    setFormImageError(null)
+    showPreviewFor(file)
+    setFormImageFile(file)
+    // A fresh pick supersedes a pending removal.
+    setFormImageRemoved(false)
+  }
+
+  function handleRemoveImage() {
+    showPreviewFor(null)
+    setFormImageFile(null)
+    setFormImageError(null)
+    if (imageInputRef.current) imageInputRef.current.value = ''
+    // Only a photo that already exists on the server needs deleting; a pick
+    // that was never uploaded simply goes away.
+    setFormImageRemoved(Boolean(formImageUrl))
+  }
+
+  /** What the preview tile should show right now. */
+  const imagePreviewSrc = formImagePreview ?? (formImageRemoved ? null : formImageUrl)
+  const hasPhoto = Boolean(imagePreviewSrc)
 
   async function handleSaveProduct(e: React.FormEvent) {
     e.preventDefault()
@@ -157,6 +604,16 @@ export default function MenuManager() {
       return
     }
 
+    const costNum = formCost.trim() === '' ? 0 : Number(formCost)
+    if (isNaN(costNum) || costNum < 0) {
+      setFormError('Please enter a valid unit cost (>= 0).')
+      return
+    }
+    if (costNum > 1000000) {
+      setFormError('Unit cost cannot exceed ₱1,000,000.00. Please enter a valid amount.')
+      return
+    }
+
     // Validate recipes
     const recipesPayload = formRecipes
       .filter(r => r.inventory_id && Number(r.qty_per_unit) > 0)
@@ -167,28 +624,73 @@ export default function MenuManager() {
 
     setFormLoading(true)
     try {
+      let savedProductId: string | null = null
+
       if (editingProduct) {
-        await apiUpdateProduct(editingProduct.id, {
+        const updated = await apiUpdateProduct(editingProduct.id, {
           name: formName.trim(),
           category_id: formCatId,
           price: priceNum,
+          unit_cost: costNum,
           is_available: formAvailable,
+          product_type: formType,
           recipes: recipesPayload,
         })
-        showBanner('success', `"${formName}" updated successfully.`)
+        savedProductId = updated?.id ?? editingProduct.id
       } else {
-        await apiCreateProduct({
+        const created = await apiCreateProduct({
           name: formName.trim(),
           category_id: formCatId,
           price: priceNum,
+          unit_cost: costNum,
           is_available: formAvailable,
+          product_type: formType,
           recipes: recipesPayload,
         })
-        showBanner('success', `"${formName}" added to the menu!`)
+        savedProductId = created?.id ?? null
+      }
+
+      /*
+       * The photo is a second step, not part of the payload above.
+       *
+       * Two reasons: the object path needs a real product id (which a new item
+       * only has after the insert), and keeping it separate means "add a photo"
+       * and "change a photo" run through exactly one code path instead of two
+       * that could drift apart.
+       *
+       * A failure here is reported honestly rather than rolled back — the menu
+       * item itself is already saved, and silently discarding it because a JPEG
+       * was too big would be the worse outcome.
+       */
+      let photoWarning: string | null = null
+      try {
+        if (formImageFile && savedProductId) {
+          await apiUploadProductImage(savedProductId, formImageFile)
+        } else if (formImageRemoved && savedProductId) {
+          await apiRemoveProductImage(savedProductId)
+        }
+      } catch (imgErr: unknown) {
+        photoWarning = imgErr instanceof Error ? imgErr.message : 'the upload failed.'
       }
 
       setShowItemModal(false)
       await loadData()
+
+      if (photoWarning) {
+        showBanner('error', `"${formName}" was saved, but the photo was not: ${photoWarning}`)
+      } else {
+        showBanner(
+          'success',
+          editingProduct ? `"${formName}" updated successfully.` : `"${formName}" added to the menu!`,
+        )
+      }
+
+      // Broadcast menu update to Dashboard and other windows
+      dispatchNotification({
+        category: 'system',
+        title: editingProduct ? 'Menu Item Updated' : 'New Menu Item Added',
+        body: `"${formName}" (₱${priceNum.toFixed(2)}) was ${editingProduct ? 'updated' : 'added to the menu'}.`,
+      })
     } catch (err: unknown) {
       setFormError(err instanceof Error ? err.message : 'Failed to save product')
     } finally {
@@ -207,42 +709,63 @@ export default function MenuManager() {
         'success',
         `"${prod.name}" marked as ${nextState ? 'Available' : 'Out of Stock'}.`
       )
+      dispatchNotification({
+        category: 'system',
+        title: 'Product Availability Changed',
+        body: `"${prod.name}" is now ${nextState ? 'Available' : 'Out of Stock'}.`,
+      })
     } catch (err: unknown) {
       showBanner('error', err instanceof Error ? err.message : 'Failed to toggle availability')
     }
   }
 
-  async function handleDeleteProduct(prod: Product) {
-    setDeleteConfirm(prod)
-  }
+  /** Product awaiting delete confirmation, set from the row action. */
+  const [pendingDelete, setPendingDelete] = useState<Product | null>(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
 
-  async function confirmDeleteProduct() {
-    if (!deleteConfirm) return
-    const prod = deleteConfirm
-    setDeleteConfirm(null)
+  async function runDeleteProduct() {
+    if (!pendingDelete) return
+    const prod = pendingDelete
+    setDeleteBusy(true)
     try {
       await apiDeleteProduct(prod.id)
       setProducts(prev => prev.filter(p => p.id !== prod.id))
       showBanner('success', `"${prod.name}" deleted from menu.`)
     } catch (err: unknown) {
       showBanner('error', err instanceof Error ? err.message : 'Failed to delete product')
+    } finally {
+      setDeleteBusy(false)
+      setPendingDelete(null)
     }
   }
 
   async function handleCreateCategory(e: React.FormEvent) {
     e.preventDefault()
     setCatError(null)
-    if (!newCatName.trim()) {
-      setCatError('Category name is required.')
+
+    // Determine the final category name: a preset or a custom entry
+    const isCustom = selectedPresetCategory === '__custom__'
+    const finalName = isCustom ? newCatName.trim() : selectedPresetCategory
+
+    if (!finalName) {
+      setCatError(isCustom ? 'Please enter a custom category name.' : 'Please select a category from the list.')
+      return
+    }
+
+    // Check if this category already exists in the loaded list (client-side fast path)
+    const alreadyExists = categories.some(c => c.name.toLowerCase() === finalName.toLowerCase())
+    if (alreadyExists) {
+      setCatError(`The category "${finalName}" already exists. Pick it from the Category dropdown in the form instead.`)
       return
     }
 
     setCatLoading(true)
     try {
-      const created = await apiCreateCategory(newCatName.trim())
+      const created = await apiCreateCategory(finalName)
       setCategories(prev => [...prev, created])
       setFormCatId(created.id)
       setNewCatName('')
+      setSelectedPresetCategory('')
       setShowCategoryModal(false)
       showBanner('success', `Category "${created.name}" created!`)
     } catch (err: unknown) {
@@ -269,7 +792,7 @@ export default function MenuManager() {
   const outOfStockItems = totalItems - activeItems
 
   return (
-    <div style={{ padding: 'clamp(16px, 4vw, 32px) clamp(16px, 4vw, 36px)', maxWidth: 1400, margin: '0 auto' }}>
+    <div className="page" style={{ maxWidth: 1400, margin: '0 auto' }}>
       {/* Header */}
       <div
         style={{
@@ -284,14 +807,14 @@ export default function MenuManager() {
         <div>
           <h1
             style={{
-              fontFamily: 'Fraunces',
+              fontFamily: 'Inter',
               fontSize: 32,
               fontWeight: 700,
               color: 'var(--foreground)',
               marginBottom: 6,
             }}
           >
-            Menu & Food Items
+            Menu Items
           </h1>
           <p style={{ fontSize: 15, color: 'var(--muted-foreground)' }}>
             Add new food items, update prices, configure raw ingredient consumption, and toggle POS availability.
@@ -305,6 +828,7 @@ export default function MenuManager() {
             onClick={() => {
               setCatError(null)
               setNewCatName('')
+              setSelectedPresetCategory('')
               setShowCategoryModal(true)
             }}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 16px' }}
@@ -315,7 +839,7 @@ export default function MenuManager() {
               <rect x="14" y="14" width="7" height="7"/>
               <rect x="3" y="14" width="7" height="7"/>
             </svg>
-            Add Category
+            + Add Category
           </button>
 
           <button
@@ -328,7 +852,7 @@ export default function MenuManager() {
               <line x1="12" y1="5" x2="12" y2="19"/>
               <line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
-            Add Food Item
+            + Add Food Item
           </button>
         </div>
       </div>
@@ -352,12 +876,28 @@ export default function MenuManager() {
           }}
         >
           <span>{banner.message}</span>
-          <button
-            onClick={() => setBanner(null)}
-            style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'inherit', fontWeight: 700 }}
-          >
-            &times;
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            {banner.type === 'error' && (
+              <button
+                type="button"
+                onClick={() => { setBanner(null); loadData() }}
+                style={{
+                  background: 'transparent', border: '1px solid currentColor', borderRadius: 6,
+                  cursor: 'pointer', color: 'inherit', fontWeight: 600, fontSize: 12, padding: '4px 12px',
+                  fontFamily: 'Inter',
+                }}
+              >
+                Try again
+              </button>
+            )}
+            <button
+              onClick={() => setBanner(null)}
+              aria-label="Dismiss message"
+              style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'inherit', fontWeight: 700, fontSize: 16, lineHeight: 1 }}
+            >
+              &times;
+            </button>
+          </div>
         </div>
       )}
 
@@ -365,46 +905,29 @@ export default function MenuManager() {
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+          gridTemplateColumns: 'repeat(4, 1fr)',
           gap: 16,
           marginBottom: 28,
         }}
       >
-        <div className="card" style={{ padding: '20px 22px' }}>
-          <p style={{ fontSize: 12, fontFamily: 'DM Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-            Total Menu Items
-          </p>
-          <p style={{ fontFamily: 'Fraunces', fontSize: 30, fontWeight: 700, color: 'var(--foreground)' }}>
-            {totalItems}
-          </p>
-        </div>
-
-        <div className="card" style={{ padding: '20px 22px' }}>
-          <p style={{ fontSize: 12, fontFamily: 'DM Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-            Active in POS
-          </p>
-          <p style={{ fontFamily: 'Fraunces', fontSize: 30, fontWeight: 700, color: '#15803d' }}>
-            {activeItems}
-          </p>
-        </div>
-
-        <div className="card" style={{ padding: '20px 22px' }}>
-          <p style={{ fontSize: 12, fontFamily: 'DM Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-            Out of Stock
-          </p>
-          <p style={{ fontFamily: 'Fraunces', fontSize: 30, fontWeight: 700, color: outOfStockItems > 0 ? '#b91c1c' : 'var(--muted-foreground)' }}>
-            {outOfStockItems}
-          </p>
-        </div>
-
-        <div className="card" style={{ padding: '20px 22px' }}>
-          <p style={{ fontSize: 12, fontFamily: 'DM Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-            Categories
-          </p>
-          <p style={{ fontFamily: 'Fraunces', fontSize: 30, fontWeight: 700, color: 'var(--primary)' }}>
-            {categories.length}
-          </p>
-        </div>
+        {[
+          { label: 'Total Menu Items', val: totalItems, color: '#9b5e28', note: 'All catalog items' },
+          { label: 'Active in POS', val: activeItems, color: '#4a7c4e', note: 'Available to order' },
+          { label: 'Out of Stock', val: outOfStockItems, color: outOfStockItems > 0 ? '#b91c1c' : 'var(--muted-foreground)', note: outOfStockItems > 0 ? 'Needs restock' : 'Fully stocked' },
+          { label: 'Categories', val: categories.length, color: '#c47a2e', note: 'Active food groups' },
+        ].map(k => (
+          <div key={k.label} className="card" style={{ padding: '22px 24px', textAlign: 'center' }}>
+            <p style={{ fontSize: 11, color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8, fontFamily: 'IBM Plex Mono' }}>
+              {k.label}
+            </p>
+            <p style={{ fontFamily: 'Inter', fontSize: 28, fontWeight: 700, color: k.color, lineHeight: 1, textAlign: 'center' }}>
+              {k.val}
+            </p>
+            <p style={{ fontSize: 12, color: 'var(--muted-foreground)', marginTop: 8 }}>
+              {k.note}
+            </p>
+          </div>
+        ))}
       </div>
 
       {/* Filters and search */}
@@ -505,33 +1028,48 @@ export default function MenuManager() {
               : 'Click "+ Add Food Item" above to add your first menu dish!'}
           </p>
         </div>
+      ) : isCompact ? (
+        /* Phones: one card per menu item. The 6-column table needed ~900px,
+           so half of it (recipe, POS status, actions) was off-screen. */
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {filteredProducts.map(prod => (
+            <MenuCard
+              key={prod.id}
+              prod={prod}
+              onEdit={() => openEditModal(prod)}
+              onDelete={() => setPendingDelete(prod)}
+              onToggle={() => handleToggleAvailability(prod)}
+            />
+          ))}
+          {filteredProducts.length === 0 && (
+            <div className="card" style={{ padding: '40px 20px', textAlign: 'center', fontSize: 14, color: 'var(--muted-foreground)' }}>
+              No menu items match this filter.
+            </div>
+          )}
+        </div>
       ) : (
         <div className="card" style={{ overflow: 'hidden' }}>
-          <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' as const }}>
+          <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 13 }}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)', background: 'rgba(0,0,0,0.02)' }}>
-                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontSize: 12 }}>ITEM NAME</th>
-                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontSize: 12 }}>CATEGORY</th>
-                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontSize: 12 }}>PRICE</th>
-                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontSize: 12 }}>INVENTORY RECIPE</th>
-                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontSize: 12, textAlign: 'center' }}>POS STATUS</th>
-                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontSize: 12, textAlign: 'right' }}>ACTIONS</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12 }}>ITEM NAME</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12 }}>CATEGORY</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12 }}>PRICE</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12 }}>UNIT COST</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12 }}>MARGIN</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12 }}>INVENTORY RECIPE</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12, textAlign: 'center' }}>POS STATUS</th>
+                  <th style={{ padding: '14px 20px', fontWeight: 600, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontSize: 12, textAlign: 'right' }}>ACTIONS</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredProducts.map(prod => {
                   const catName = (prod.category as ProductCategory | undefined)?.name ?? '—'
                   const recipeCount = prod.recipes?.length ?? 0
-                  const prodType = (prod as Product & { product_type?: string }).product_type ?? 'Regular'
-                  const typeConfig: Record<string, { label: string; bg: string; color: string }> = {
-                    Bestseller: { label: 'Bestseller', bg: '#fff7e6', color: '#b45309' },
-                    New:        { label: 'New',        bg: '#e8f5e9', color: '#15803d' },
-                    Seasonal:   { label: 'Seasonal',   bg: '#fce8e8', color: '#b91c1c' },
-                    Special:    { label: 'Special',    bg: '#f0f4ff', color: '#4338ca' },
-                    Regular:    { label: 'Regular',    bg: 'transparent', color: 'var(--muted-foreground)' },
-                  }
-                  const tc = typeConfig[prodType] ?? typeConfig.Regular
+                  const prodType = prod.product_type ?? 'Regular'
+                  const tc = TYPE_CONFIG[prodType] ?? TYPE_CONFIG.Regular
+                  const margin = getMarginInfo(prod.price, prod.unit_cost ?? 0)
 
                   return (
                     <tr
@@ -546,15 +1084,19 @@ export default function MenuManager() {
                     >
                       {/* Name */}
                       <td style={{ padding: '16px 20px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                          <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--foreground)' }}>
-                            {prod.name}
-                          </span>
-                          {prodType !== 'Regular' && (
-                            <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 12, background: tc.bg, color: tc.color, fontWeight: 700, whiteSpace: 'nowrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                          <div style={{ width: 44, flexShrink: 0 }}>
+                            <FoodImage name={prod.name} src={prod.image_url} height={44} radius={8} />
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
+                            <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--foreground)' }}>
+                              {prod.name}
+                            </span>
+                            <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 12, background: tc.bg, color: tc.color, border: tc.border, fontWeight: 700, whiteSpace: 'nowrap' }}>
                               {tc.label}
                             </span>
-                          )}
+
+                          </div>
                         </div>
                       </td>
 
@@ -568,7 +1110,7 @@ export default function MenuManager() {
                             fontWeight: 500,
                             background: 'rgba(155,94,40,0.1)',
                             color: 'var(--primary)',
-                            fontFamily: 'DM Mono',
+                            fontFamily: 'IBM Plex Mono',
                           }}
                         >
                           {catName}
@@ -576,8 +1118,35 @@ export default function MenuManager() {
                       </td>
 
                       {/* Price */}
-                      <td style={{ padding: '16px 20px', fontFamily: 'DM Mono', fontWeight: 700, fontSize: 15, color: 'var(--foreground)' }}>
+                      <td style={{ padding: '16px 20px', fontFamily: 'IBM Plex Mono', fontWeight: 700, fontSize: 14, color: 'var(--foreground)' }}>
                         &#8369;{Number(prod.price).toFixed(2)}
+                      </td>
+
+                      {/* Unit Cost */}
+                      <td style={{ padding: '16px 20px', fontFamily: 'IBM Plex Mono', fontWeight: 600, fontSize: 14, color: 'var(--muted-foreground)' }}>
+                        &#8369;{Number(prod.unit_cost || 0).toFixed(2)}
+                      </td>
+
+                      {/* Margin */}
+                      <td style={{ padding: '16px 20px' }}>
+                        <span
+                          title={`Profit: ${margin.profit >= 0 ? '+' : ''}₱${margin.profit.toFixed(2)} / unit`}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            padding: '4px 9px',
+                            borderRadius: 12,
+                            fontSize: 12,
+                            fontWeight: 700,
+                            fontFamily: 'IBM Plex Mono',
+                            background: margin.bg,
+                            color: margin.color,
+                            border: margin.border,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {margin.label}
+                        </span>
                       </td>
 
                       {/* Inventory Recipe */}
@@ -587,23 +1156,7 @@ export default function MenuManager() {
                             None linked
                           </span>
                         ) : (
-                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 300 }}>
-                            {prod.recipes?.map((r, i) => (
-                              <span
-                                key={i}
-                                style={{
-                                  fontSize: 11,
-                                  background: 'rgba(0,0,0,0.05)',
-                                  padding: '3px 8px',
-                                  borderRadius: 4,
-                                  color: 'var(--foreground)',
-                                  fontFamily: 'DM Mono',
-                                }}
-                              >
-                                {r.inventory?.name ?? 'Item'} &times; {r.qty_per_unit} {r.inventory?.unit ?? ''}
-                              </span>
-                            ))}
-                          </div>
+                          <RecipeList recipes={prod.recipes ?? []} />
                         )}
                       </td>
 
@@ -639,7 +1192,7 @@ export default function MenuManager() {
                             Edit
                           </button>
                           <button
-                            onClick={() => handleDeleteProduct(prod)}
+                            onClick={() => setPendingDelete(prod)}
                             style={{
                               padding: '6px 12px',
                               fontSize: 12,
@@ -700,13 +1253,13 @@ export default function MenuManager() {
               maxWidth: 580,
               maxHeight: '90vh',
               overflowY: 'auto',
-              padding: 'clamp(16px, 4vw, 28px) clamp(16px, 4vw, 30px)',
+              padding: '28px 30px',
               boxShadow: '0 25px 60px rgba(0,0,0,0.35)',
             }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
               <div>
-                <h2 style={{ fontFamily: 'Fraunces', fontSize: 22, fontWeight: 700, color: 'var(--foreground)' }}>
+                <h2 style={{ fontFamily: 'Inter', fontSize: 22, fontWeight: 700, color: 'var(--foreground)' }}>
                   {editingProduct ? 'Edit Food Item' : 'Add New Food Item'}
                 </h2>
                 <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginTop: 2 }}>
@@ -736,6 +1289,95 @@ export default function MenuManager() {
                   value={formName}
                   onChange={e => setFormName(e.target.value)}
                   style={{ width: '100%', padding: '10px 14px', fontSize: 14 }}
+                />
+              </div>
+
+              {/* Food photo — pick, replace or clear the dish's picture.
+                  The preview tile is the same component the POS grid and the
+                  menu list use, so what you see here is exactly what staff see. */}
+              <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, marginBottom: 10 }}>
+                  <div>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--foreground)' }}>
+                      Food Photo (Optional)
+                    </span>
+                    <p style={{ fontSize: 12, color: 'var(--muted-foreground)' }}>
+                      Shown on the POS tiles and in the menu list.
+                    </p>
+                  </div>
+                  {hasPhoto && (
+                    <button
+                      type="button"
+                      onClick={handleRemoveImage}
+                      style={{
+                        flexShrink: 0, fontSize: 12, fontWeight: 600, padding: '5px 11px',
+                        borderRadius: 6, cursor: 'pointer',
+                        border: '1px solid #fca5a5', background: 'transparent', color: 'var(--danger)',
+                      }}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
+                  <div style={{ width: 96, flexShrink: 0 }}>
+                    <FoodImage
+                      name={formName.trim() || 'Menu item'}
+                      src={imagePreviewSrc}
+                      height={96}
+                      radius={10}
+                    />
+                  </div>
+
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <button
+                      type="button"
+                      id="btn-pick-food-image"
+                      onClick={() => imageInputRef.current?.click()}
+                      className="btn-ghost"
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 14px', fontSize: 13 }}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                        <circle cx="8.5" cy="8.5" r="1.5" />
+                        <polyline points="21 15 16 10 5 21" />
+                      </svg>
+                      {hasPhoto ? 'Change Photo' : 'Choose Photo'}
+                    </button>
+
+                    <p style={{ fontSize: 11.5, color: 'var(--muted-foreground)', marginTop: 7 }}>
+                      JPG, PNG or WebP &middot; up to 5 MB
+                    </p>
+
+                    {formImageFile && (
+                      <p style={{ fontSize: 11.5, color: 'var(--primary)', marginTop: 4, overflowWrap: 'anywhere' }}>
+                        Ready to upload: {formImageFile.name}
+                      </p>
+                    )}
+                    {formImageRemoved && (
+                      <p style={{ fontSize: 11.5, color: 'var(--danger)', marginTop: 4 }}>
+                        Photo will be removed when you save.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                {formImageError && (
+                  <div style={{ marginTop: 10, padding: '8px 12px', background: '#fee2e2', color: '#991b1b', borderRadius: 6, fontSize: 12 }}>
+                    {formImageError}
+                  </div>
+                )}
+
+                {/* Hidden native picker — the visible control is the button
+                    above, so the file input can be styled like the rest of the
+                    form instead of like a browser default. */}
+                <input
+                  ref={imageInputRef}
+                  type="file"
+                  accept={ACCEPTED_IMAGE_TYPES.join(',')}
+                  onChange={e => handlePickImage(e.target.files?.[0])}
+                  style={{ display: 'none' }}
                 />
               </div>
 
@@ -771,42 +1413,42 @@ export default function MenuManager() {
                 </div>
               </div>
 
-              {/* Category & Price */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 14 }}>
-                <div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                    <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--foreground)' }}>
-                      CATEGORY *
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => setShowCategoryModal(true)}
-                      style={{ fontSize: 11, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}
-                    >
-                      + New Category
-                    </button>
-                  </div>
-                  <select
-                    className="input"
-                    value={formCatId}
-                    onChange={e => setFormCatId(e.target.value)}
-                    style={{ width: '100%', padding: '10px 12px', fontSize: 13 }}
+              {/* Category */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--foreground)' }}>
+                    CATEGORY *
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setShowCategoryModal(true)}
+                    style={{ fontSize: 11, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}
                   >
-                    <option value="" disabled>Select a category…</option>
-                    {categories.map(c => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
+                    + New Category
+                  </button>
                 </div>
+                <select
+                  className="input"
+                  value={formCatId}
+                  onChange={e => setFormCatId(e.target.value)}
+                  style={{ width: '100%', padding: '10px 12px', fontSize: 13 }}
+                >
+                  {categories.map(c => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
+              {/* Selling Price & Unit Cost (Side-by-Side) */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
                 <div>
                   <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--foreground)', marginBottom: 6 }}>
-                    PRICE (PHP) *
+                    SELLING PRICE (PHP) *
                   </label>
                   <div style={{ position: 'relative' }}>
-                    <span style={{ position: 'absolute', left: 12, top: 10, color: 'var(--muted-foreground)', fontFamily: 'DM Mono', fontWeight: 600 }}>
+                    <span style={{ position: 'absolute', left: 12, top: 10, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontWeight: 600 }}>
                       &#8369;
                     </span>
                     <input
@@ -818,7 +1460,6 @@ export default function MenuManager() {
                       required
                       placeholder="0.00"
                       value={formPrice}
-                      onKeyDown={e => { if (e.key === '-' || e.key === 'e' || e.key === 'E') e.preventDefault() }}
                       onChange={e => {
                         const val = e.target.value
                         // Clamp to max immediately
@@ -828,12 +1469,138 @@ export default function MenuManager() {
                           setFormPrice(val)
                         }
                       }}
-                      style={{ width: '100%', padding: '10px 14px 10px 30px', fontSize: 14, fontFamily: 'DM Mono' }}
+                      style={{ width: '100%', padding: '10px 14px 10px 30px', fontSize: 14, fontFamily: 'IBM Plex Mono' }}
                     />
                   </div>
-                  <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }}>Max ₱10,000.00</p>
+                  <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }}>Menu customer price (Max ₱10,000)</p>
+                </div>
+
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--foreground)', marginBottom: 6 }}>
+                    UNIT COST / COST PRICE (PHP)
+                  </label>
+                  <div style={{ position: 'relative' }}>
+                    <span style={{ position: 'absolute', left: 12, top: 10, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', fontWeight: 600 }}>
+                      &#8369;
+                    </span>
+                    <input
+                      className="input"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      max="1000000"
+                      placeholder="0.00"
+                      value={formCost}
+                      onChange={e => { setFormCost(e.target.value); setCostManuallySet(true) }}
+                      style={{
+                        width: '100%', padding: '10px 14px 10px 30px', fontSize: 14, fontFamily: 'IBM Plex Mono',
+                        background: !costManuallySet && Number(formCost) > 0 ? '#f0f9ff' : undefined,
+                        borderColor: !costManuallySet && Number(formCost) > 0 ? '#7dd3fc' : undefined,
+                      }}
+                    />
+                  </div>
+                  <p style={{ fontSize: 11, color: !costManuallySet && Number(formCost) > 0 ? '#0369a1' : 'var(--muted-foreground)', marginTop: 4 }}>
+                    {!costManuallySet && Number(formCost) > 0
+                      ? 'Auto-filled from recipe ingredients'
+                      : 'Ingredient / purchase cost'}
+                  </p>
                 </div>
               </div>
+
+              {/* Dynamic Expected Profit Margin Badge */}
+              {(() => {
+                const p = parseFloat(formPrice) || 0
+                const c = parseFloat(formCost) || 0
+                const margin = getMarginInfo(p, c)
+                const hasPrice = p > 0
+                const hasCost = c > 0
+
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {/* Main margin badge */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '10px 14px',
+                        borderRadius: 8,
+                        background: hasPrice ? margin.bg : 'rgba(0,0,0,0.03)',
+                        border: hasPrice ? margin.border : '1px dashed var(--border)',
+                        transition: 'all 0.2s',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {/* ₱ peso icon instead of dollar sign */}
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                          <text x="12" y="17" textAnchor="middle" fontSize="16" fontWeight="700"
+                            stroke="none" fill={hasPrice ? margin.color : 'var(--muted-foreground)'}>₱</text>
+                        </svg>
+                        <span style={{ fontSize: 12.5, fontWeight: 600, color: hasPrice ? margin.color : 'var(--muted-foreground)' }}>
+                          Expected Profit Margin
+                        </span>
+                      </div>
+
+                      <div style={{ textAlign: 'right' }}>
+                        {hasPrice ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <span style={{ fontFamily: 'IBM Plex Mono', fontWeight: 800, fontSize: 14, color: margin.color }}>
+                              {margin.label}
+                            </span>
+                            <span style={{ fontSize: 11.5, color: margin.color, opacity: 0.9 }}>
+                              ({margin.profit >= 0 ? '+' : ''}&#8369;{margin.profit.toFixed(2)}/unit profit)
+                            </span>
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: 11.5, color: 'var(--muted-foreground)', fontStyle: 'italic' }}>
+                            Enter price and cost to calculate margin
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Cost breakdown summary row */}
+                    {hasPrice && (
+                      <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 1fr 1fr',
+                        gap: 8,
+                        padding: '10px 14px',
+                        borderRadius: 8,
+                        background: 'rgba(0,0,0,0.025)',
+                        border: '1px solid var(--border)',
+                      }}>
+                        <div>
+                          <p style={{ fontSize: 10, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>
+                            Selling Price
+                          </p>
+                          <p style={{ fontSize: 13, fontWeight: 700, fontFamily: 'IBM Plex Mono', color: 'var(--foreground)' }}>
+                            &#8369;{p.toFixed(2)}
+                          </p>
+                        </div>
+                        <div>
+                          <p style={{ fontSize: 10, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>
+                            Unit Cost
+                          </p>
+                          <p style={{ fontSize: 13, fontWeight: 700, fontFamily: 'IBM Plex Mono', color: hasCost ? 'var(--foreground)' : 'var(--muted-foreground)' }}>
+                            {hasCost ? `₱${c.toFixed(2)}` : <span style={{ fontStyle: 'italic', fontWeight: 400 }}>not set</span>}
+                          </p>
+                        </div>
+                        <div>
+                          <p style={{ fontSize: 10, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>
+                            Net Profit / Unit
+                          </p>
+                          <p style={{ fontSize: 13, fontWeight: 700, fontFamily: 'IBM Plex Mono', color: margin.color }}>
+                            {hasCost
+                              ? `${margin.profit >= 0 ? '+' : ''}₱${margin.profit.toFixed(2)}`
+                              : <span style={{ fontStyle: 'italic', fontWeight: 400, color: 'var(--muted-foreground)' }}>enter cost</span>}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
 
               {/* Availability Toggle */}
               <div
@@ -880,76 +1647,171 @@ export default function MenuManager() {
                   </button>
                 </div>
 
-                {formRecipes.length === 0 ? (
-                  <p style={{ fontSize: 12, color: 'var(--muted-foreground)', fontStyle: 'italic', padding: '10px 0' }}>
-                    No raw inventory items linked yet. Click "+ Add Ingredient" if this dish consumes inventory stock.
-                  </p>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
-                    {formRecipes.map((row, idx) => {
-                      const selectedItem = inventoryList.find(i => i.id === row.inventory_id)
-                      return (
-                        <div
-                          key={idx}
-                          style={{
-                            display: 'flex',
-                            gap: 10,
-                            alignItems: 'center',
-                            background: 'rgba(0,0,0,0.02)',
-                            padding: '8px 10px',
-                            borderRadius: 6,
-                            border: '1px solid var(--border)',
-                          }}
-                        >
-                          <select
-                            className="input"
-                            value={row.inventory_id}
-                            onChange={e => updateRecipeRow(idx, 'inventory_id', e.target.value)}
-                            style={{ flex: 2, padding: '7px 10px', fontSize: 13 }}
-                          >
-                            {inventoryList.map(inv => (
-                              <option key={inv.id} value={inv.id}>
-                                {inv.name} ({inv.stock_qty} {inv.unit} in stock)
-                              </option>
-                            ))}
-                          </select>
+{(() => {
+                  // Compute total ingredient cost from recipe rows using inventory unit_cost
+                  const recipeCostTotal = formRecipes.reduce((sum, row) => {
+                    const inv = inventoryList.find(i => i.id === row.inventory_id)
+                    const qty = Number(row.qty_per_unit) || 0
+                    const cost = Number(inv?.unit_cost) || 0
+                    return sum + qty * cost
+                  }, 0)
+                  const hasRecipeCost = formRecipes.length > 0 && recipeCostTotal > 0
 
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1 }}>
-                            <input
-                              className="input"
-                              type="number"
-                              step="0.01"
-                              min="0.01"
-                              placeholder="Qty"
-                              value={row.qty_per_unit}
-                              onChange={e => updateRecipeRow(idx, 'qty_per_unit', e.target.value)}
-                              style={{ width: '100%', padding: '7px 10px', fontSize: 13, fontFamily: 'DM Mono' }}
-                            />
-                            <span style={{ fontSize: 12, color: 'var(--muted-foreground)', minWidth: 30 }}>
-                              {selectedItem?.unit ?? ''}
-                            </span>
-                          </div>
+                  return (
+                    <>
+                      {formRecipes.length === 0 ? (
+                        <p style={{ fontSize: 12, color: 'var(--muted-foreground)', fontStyle: 'italic', padding: '10px 0' }}>
+                          No raw inventory items linked yet. Click "+ Add Ingredient" if this dish consumes inventory stock.
+                        </p>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                          {formRecipes.map((row, idx) => {
+                            const selectedItem = inventoryList.find(i => i.id === row.inventory_id)
+                            const qty = Number(row.qty_per_unit) || 0
+                            const invCost = Number(selectedItem?.unit_cost) || 0
+                            const lineCost = qty * invCost
+                            return (
+                              <div
+                                key={idx}
+                                style={{
+                                  background: 'rgba(0,0,0,0.02)',
+                                  padding: '8px 10px',
+                                  borderRadius: 6,
+                                  border: '1px solid var(--border)',
+                                }}
+                              >
+                                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                                  <select
+                                    className="input"
+                                    value={row.inventory_id}
+                                    onChange={e => updateRecipeRow(idx, 'inventory_id', e.target.value)}
+                                    style={{ flex: 2, padding: '7px 10px', fontSize: 13 }}
+                                  >
+                                    {inventoryList.map(inv => (
+                                      <option key={inv.id} value={inv.id}>
+                                        {inv.name} ({inv.stock_qty} {inv.unit} in stock)
+                                      </option>
+                                    ))}
+                                  </select>
 
-                          <button
-                            type="button"
-                            onClick={() => removeRecipeRow(idx)}
-                            style={{
-                              background: 'transparent',
-                              border: 'none',
-                              color: '#b91c1c',
-                              cursor: 'pointer',
-                              fontSize: 16,
-                              padding: '4px 8px',
-                            }}
-                            title="Remove ingredient"
-                          >
-                            &times;
-                          </button>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1 }}>
+                                    <input
+                                      className="input"
+                                      type="number"
+                                      step="0.01"
+                                      min="0.01"
+                                      placeholder="Qty"
+                                      value={row.qty_per_unit}
+                                      onChange={e => updateRecipeRow(idx, 'qty_per_unit', e.target.value)}
+                                      style={{ width: '100%', padding: '7px 10px', fontSize: 13, fontFamily: 'IBM Plex Mono' }}
+                                    />
+                                    <span style={{ fontSize: 12, color: 'var(--muted-foreground)', minWidth: 30 }}>
+                                      {selectedItem?.unit ?? ''}
+                                    </span>
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => removeRecipeRow(idx)}
+                                    style={{
+                                      background: 'transparent',
+                                      border: 'none',
+                                      color: '#b91c1c',
+                                      cursor: 'pointer',
+                                      fontSize: 16,
+                                      padding: '4px 8px',
+                                    }}
+                                    title="Remove ingredient"
+                                  >
+                                    &times;
+                                  </button>
+                                </div>
+
+                                {/* Per-ingredient cost hint */}
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5, paddingTop: 5, borderTop: '1px dashed var(--border)' }}>
+                                  <span style={{ fontSize: 11, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono' }}>
+                                    {invCost > 0
+                                      ? `&#8369;${invCost.toFixed(2)} / ${selectedItem?.unit ?? 'unit'} (inventory cost)`
+                                      : <span style={{ fontStyle: 'italic' }}>No unit cost set in inventory</span>}
+                                  </span>
+                                  <span style={{
+                                    fontSize: 11,
+                                    fontWeight: 700,
+                                    fontFamily: 'IBM Plex Mono',
+                                    color: lineCost > 0 ? 'var(--foreground)' : 'var(--muted-foreground)',
+                                  }}>
+                                    {lineCost > 0 ? `= &#8369;${lineCost.toFixed(2)}` : '—'}
+                                  </span>
+                                </div>
+                              </div>
+                            )
+                          })}
+
+                          {/* Recipe cost total + auto-fill notice */}
+                          {hasRecipeCost && (
+                            <div style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              padding: '9px 12px',
+                              borderRadius: 6,
+                              background: '#f0f9ff',
+                              border: '1px solid #bae6fd',
+                            }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0369a1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                                </svg>
+                                <span style={{ fontSize: 12, color: '#0369a1', fontWeight: 600 }}>
+                                  Total ingredient cost auto-calculated
+                                </span>
+                              </div>
+                              <span style={{ fontSize: 13, fontWeight: 800, fontFamily: 'IBM Plex Mono', color: '#0369a1' }}>
+                                &#8369;{recipeCostTotal.toFixed(2)}
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Auto-fill the Unit Cost field from recipe total */}
+                          {hasRecipeCost && (
+                            <div style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              padding: '8px 12px',
+                              borderRadius: 6,
+                              background: 'rgba(0,0,0,0.025)',
+                              border: '1px dashed var(--border)',
+                            }}>
+                              <span style={{ fontSize: 12, color: 'var(--muted-foreground)' }}>
+                                {costManuallySet
+                                  ? 'Unit Cost is manually set — recipe total not applied.'
+                                  : 'Unit Cost field auto-filled from ingredients above.'}
+                              </span>
+                              {costManuallySet ? (
+                                <button
+                                  type="button"
+                                  onClick={() => { setFormCost(recipeCostTotal.toFixed(2)); setCostManuallySet(false) }}
+                                  style={{ fontSize: 11, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}
+                                >
+                                  Use recipe cost (&#8369;{recipeCostTotal.toFixed(2)})
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setCostManuallySet(true)}
+                                  style={{ fontSize: 11, color: 'var(--muted-foreground)', background: 'none', border: 'none', cursor: 'pointer' }}
+                                >
+                                  Override manually
+                                </button>
+                              )}
+                            </div>
+                          )}
                         </div>
-                      )
-                    })}
-                  </div>
-                )}
+                      )}
+                    </>
+                  )
+                })()}
               </div>
 
               {formError && (
@@ -1013,7 +1875,7 @@ export default function MenuManager() {
               boxShadow: '0 25px 60px rgba(0,0,0,0.3)',
             }}
           >
-            <h3 style={{ fontFamily: 'Fraunces', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
+            <h3 style={{ fontFamily: 'Inter', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
               New Category
             </h3>
             <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 16 }}>
@@ -1023,17 +1885,41 @@ export default function MenuManager() {
             <form onSubmit={handleCreateCategory} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div>
                 <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--foreground)', marginBottom: 6 }}>
-                  CATEGORY NAME *
+                  SELECT CATEGORY *
                 </label>
-                <input
+                <select
                   className="input"
                   autoFocus
-                  required
-                  placeholder="e.g. Desserts"
-                  value={newCatName}
-                  onChange={e => setNewCatName(e.target.value)}
-                  style={{ width: '100%', padding: '9px 12px', fontSize: 14 }}
-                />
+                  value={selectedPresetCategory}
+                  onChange={e => {
+                    setSelectedPresetCategory(e.target.value)
+                    if (e.target.value !== '__custom__') setNewCatName('')
+                  }}
+                  style={{ width: '100%', padding: '10px 12px', fontSize: 14 }}
+                >
+                  <option value="">— Choose a category —</option>
+                  {PRESET_CATEGORIES.filter(pc =>
+                    !categories.some(c => c.name.toLowerCase() === pc.toLowerCase())
+                  ).map(pc => (
+                    <option key={pc} value={pc}>{pc}</option>
+                  ))}
+                  <option value="__custom__">Custom (type your own)…</option>
+                </select>
+                {selectedPresetCategory === '__custom__' && (
+                  <div style={{ marginTop: 10 }}>
+                    <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--foreground)', marginBottom: 6 }}>
+                      CUSTOM CATEGORY NAME *
+                    </label>
+                    <input
+                      className="input"
+                      required
+                      placeholder="e.g. Loaded Fries"
+                      value={newCatName}
+                      onChange={e => setNewCatName(e.target.value)}
+                      style={{ width: '100%', padding: '9px 12px', fontSize: 14 }}
+                    />
+                  </div>
+                )}
               </div>
 
               {catError && (
@@ -1065,55 +1951,18 @@ export default function MenuManager() {
         </div>,
         document.body
       )}
-      {/* Delete Confirmation Modal */}
-      {deleteConfirm && typeof document !== 'undefined' && createPortal(
-        <div
-          style={{
-            position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
-            background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)',
-            WebkitBackdropFilter: 'blur(4px)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10001, padding: 20,
-          }}
-          onClick={e => { if (e.target === e.currentTarget) setDeleteConfirm(null) }}
-        >
-          <div className="card fade-in" style={{ padding: 'clamp(20px, 4vw, 32px) clamp(16px, 4vw, 28px)', maxWidth: 400, width: '100%', textAlign: 'center', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
-            <div style={{ width: 54, height: 54, borderRadius: '50%', background: 'rgba(185,28,28,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#b91c1c" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="3 6 5 6 21 6"/>
-                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                <path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
-              </svg>
-            </div>
-            <h2 style={{ fontFamily: 'Fraunces', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 8 }}>Delete Menu Item?</h2>
-            <p style={{ fontSize: 14, color: 'var(--muted-foreground)', marginBottom: 6, lineHeight: 1.6 }}>
-              Are you sure you want to delete
-            </p>
-            <p style={{ fontSize: 15, fontWeight: 700, color: 'var(--foreground)', marginBottom: 20 }}>"{deleteConfirm.name}"?</p>
-            <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 22 }}>This will permanently remove the item from the menu. This action cannot be undone.</p>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button
-                id="btn-delete-cancel"
-                className="btn-ghost"
-                onClick={() => setDeleteConfirm(null)}
-                style={{ flex: 1, padding: '12px' }}
-              >
-                Cancel
-              </button>
-              <button
-                id="btn-delete-confirm"
-                onClick={confirmDeleteProduct}
-                style={{
-                  flex: 1, padding: '12px', borderRadius: 8, fontSize: 14, fontWeight: 700,
-                  background: '#b91c1c', color: '#fff', border: 'none', cursor: 'pointer',
-                }}
-              >
-                Yes, Delete
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
+
+      {/* Delete product confirmation */}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={deleteBusy}
+        tone="danger"
+        title={`Delete "${pendingDelete?.name ?? ''}"?`}
+        message="This removes the item from the menu permanently. Products with past order records cannot be deleted — mark them &quot;Unavailable&quot; instead."
+        confirmLabel="Delete"
+        onConfirm={runDeleteProduct}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   )
 }

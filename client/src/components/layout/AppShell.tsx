@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useAuth } from '@/hooks/useAuth'
 import Sidebar, { type Page } from './Sidebar'
+import ErrorBoundary from '@/components/ErrorBoundary'
 import type { StaffRole } from '@/types'
 
 // Lazy page imports
@@ -11,6 +12,7 @@ import MenuManager from '@/pages/admin/MenuManager'
 import PointOfSale from '@/pages/cashier/PointOfSale'
 import Inventory from '@/pages/inventory/Inventory'
 import OrdersList from '@/pages/orders/OrdersList'
+import Settings from '@/pages/settings/Settings'
 
 const DEFAULT_PAGE: Record<StaffRole, Page> = {
   admin: 'dashboard',
@@ -20,9 +22,12 @@ const DEFAULT_PAGE: Record<StaffRole, Page> = {
 
 /** Which pages each role is allowed to access */
 const PAGE_ACCESS: Record<StaffRole, Page[]> = {
-  admin: ['dashboard', 'pos', 'orders', 'menu', 'inventory', 'analytics', 'staff'],
-  cashier: ['pos'],
-  inventory_personnel: ['inventory'],
+  admin: ['dashboard', 'pos', 'orders', 'menu', 'inventory', 'analytics', 'staff', 'settings'],
+  // Cashiers get Transactions too: it is their own sales history, and the API
+  // already scopes the query to their cashier_id, so they can look back over
+  // previous orders without ever seeing another cashier's takings.
+  cashier: ['pos', 'orders', 'settings'],
+  inventory_personnel: ['inventory', 'settings'],
 }
 
 function canAccess(role: StaffRole | null, page: Page): boolean {
@@ -30,6 +35,7 @@ function canAccess(role: StaffRole | null, page: Page): boolean {
   return PAGE_ACCESS[role].includes(page)
 }
 
+/** Human-readable page titles, shown in the mobile top bar. */
 const PAGE_TITLES: Record<Page, string> = {
   dashboard: 'Dashboard',
   pos: 'Point of Sale',
@@ -38,12 +44,19 @@ const PAGE_TITLES: Record<Page, string> = {
   inventory: 'Inventory',
   analytics: 'Analytics',
   staff: 'Staff Manager',
+  settings: 'Settings',
 }
 
+/** Below this width the sidebar collapses into a drawer and a top bar appears. */
+const DRAWER_BREAKPOINT = 1024
+
 export default function AppShell() {
-  const { role, profile } = useAuth()
+  const { role } = useAuth()
   const [page, setPage] = useState<Page>(role ? DEFAULT_PAGE[role] : 'dashboard')
-  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [isNarrow, setIsNarrow] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth < DRAWER_BREAKPOINT,
+  )
 
   // Guard: if the user tries to navigate to a page they don't have access to,
   // redirect them back to their default page.
@@ -53,98 +66,159 @@ export default function AppShell() {
     }
   }, [role, page])
 
-  const safePage = role && canAccess(role, page) ? page : (role ? DEFAULT_PAGE[role] : 'dashboard')
-
-  // Close sidebar on page change on mobile
+  // Track viewport width so we know whether the sidebar is a rail or a drawer.
   useEffect(() => {
-    setSidebarOpen(false)
-  }, [safePage])
+    const query = window.matchMedia(`(max-width: ${DRAWER_BREAKPOINT - 1}px)`)
+    const sync = () => {
+      setIsNarrow(query.matches)
+      if (!query.matches) setDrawerOpen(false)
+    }
+    sync()
+    query.addEventListener('change', sync)
+    return () => query.removeEventListener('change', sync)
+  }, [])
 
-  const initials = profile?.full_name
-    ? profile.full_name.split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase()
-    : '?'
+  // No role means no usable profile — App.tsx already renders an access-denied
+  // screen in that case, so render nothing here rather than defaulting a page.
+  if (!role) return null
+
+  const safePage = canAccess(role, page) ? page : DEFAULT_PAGE[role]
+
+  const handleNavigate = (next: Page) => {
+    setPage(next)
+    setDrawerOpen(false)
+  }
 
   return (
-    <div className="flex flex-col lg:flex-row h-[100dvh] w-full overflow-hidden bg-[var(--background)]">
-      {/* Mobile Drawer Backdrop */}
-      {sidebarOpen && (
-        <div
-          id="mobile-sidebar-backdrop"
-          className="fixed inset-0 bg-black/60 backdrop-blur-xs z-40 lg:hidden transition-opacity"
-          onClick={() => setSidebarOpen(false)}
-          aria-hidden="true"
-        />
-      )}
-
-      {/* Sidebar (Permanent on lg+, Drawer on <lg) */}
+    <div style={{ display: 'flex', height: '100dvh', overflow: 'hidden' }}>
       <Sidebar
         page={safePage}
-        setPage={setPage}
-        isOpen={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
+        setPage={handleNavigate}
+        mobileOpen={drawerOpen}
+        onCloseMobile={() => setDrawerOpen(false)}
       />
-
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
-        {/* Mobile Header (Hidden on lg+) */}
-        <header className="lg:hidden flex items-center justify-between px-3.5 sm:px-5 py-2.5 bg-[var(--sidebar)] text-[var(--sidebar-foreground)] border-b border-white/10 shrink-0 z-30 shadow-sm">
-          <div className="flex items-center gap-2.5">
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100dvh' }}>
+        {/* Mobile top bar — only shown once the sidebar has collapsed */}
+        {isNarrow && (
+          <header
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12,
+              padding: '12px 16px',
+              background: 'var(--sidebar)',
+              borderBottom: '1px solid rgba(255,255,255,0.08)',
+              flexShrink: 0,
+            }}
+          >
             <button
-              id="mobile-menu-btn"
-              onClick={() => setSidebarOpen(true)}
-              className="p-1.5 -ml-1 rounded-lg text-white/80 hover:text-white hover:bg-white/10 active:scale-95 transition-all"
+              type="button"
+              onClick={() => setDrawerOpen(true)}
               aria-label="Open navigation menu"
+              aria-expanded={drawerOpen}
+              id="btn-open-drawer"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                padding: 6,
+                color: 'var(--sidebar-foreground)',
+                display: 'flex',
+                alignItems: 'center',
+                flexShrink: 0,
+              }}
             >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="3" y1="6" x2="21" y2="6"/>
-                <line x1="3" y1="12" x2="21" y2="12"/>
-                <line x1="3" y1="18" x2="21" y2="18"/>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="3" y1="6" x2="21" y2="6" />
+                <line x1="3" y1="12" x2="21" y2="12" />
+                <line x1="3" y1="18" x2="21" y2="18" />
               </svg>
             </button>
-            <div className="flex items-center gap-2">
-              <img src="/logo.png" alt="Wingtrack" className="w-7 h-7 rounded-full object-cover border border-orange-500/50 shadow-sm" />
-              <span className="font-['Fraunces'] font-bold text-base tracking-tight text-white">WINGTRACK</span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <span className="text-xs px-2.5 py-1 rounded-full bg-[var(--primary)] text-white font-semibold shadow-xs">
-              {PAGE_TITLES[safePage]}
-            </span>
             <div
-              className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white bg-gradient-to-br from-orange-500 to-amber-600 shadow-xs"
-              title={profile?.full_name || 'Staff'}
+              id="mobile-header-logo-btn"
+              onClick={role === 'admin' ? () => handleNavigate('dashboard') : undefined}
+              role={role === 'admin' ? 'button' : undefined}
+              tabIndex={role === 'admin' ? 0 : undefined}
+              onKeyDown={role === 'admin' ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  handleNavigate('dashboard')
+                }
+              } : undefined}
+              aria-label={role === 'admin' ? 'Go to Dashboard' : undefined}
+              title={role === 'admin' ? 'Go to Dashboard' : undefined}
+              style={{
+                width: 30,
+                height: 30,
+                borderRadius: '50%',
+                overflow: 'hidden',
+                flexShrink: 0,
+                boxShadow: '0 2px 8px rgba(234,88,12,0.3)',
+                border: '1.5px solid rgba(249,115,22,0.4)',
+                background: '#ea580c',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: role === 'admin' ? 'pointer' : 'default',
+                userSelect: 'none',
+              }}
             >
-              {initials}
+              <img
+                src="/logo.png"
+                alt="Wingtrack Logo"
+                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+              />
             </div>
-          </div>
-        </header>
+            <span
+              style={{
+                fontFamily: 'Inter',
+                fontSize: 17,
+                fontWeight: 700,
+                color: 'var(--sidebar-foreground)',
+                letterSpacing: '-0.01em',
+              }}
+            >
+              {/* The mobile bar mirrors the sidebar's wording, so a cashier
+                  reads "My Transactions" in both places. */}
+              {safePage === 'orders' && role === 'cashier'
+                ? 'My Transactions'
+                : PAGE_TITLES[safePage]}
+            </span>
+          </header>
+        )}
 
-        {/* Page Content Container */}
         <main
-          className="flex-1 min-h-0 w-full"
           style={{
+            flex: 1,
+            minHeight: 0,
             overflow: safePage === 'pos' ? 'hidden' : 'auto',
             background: 'var(--background)',
           }}
         >
           <div
-            className="fade-in w-full"
+            className="fade-in"
             key={safePage}
             style={{
-              height: '100%',
+              // The POS page needs a definite height for its .pos-shell `height: 100%`
+              // to resolve, so use `height` (not `minHeight`) and let the child fill it.
+              height: safePage === 'pos' ? '100%' : undefined,
               minHeight: '100%',
               display: safePage === 'pos' ? 'flex' : 'block',
               flexDirection: 'column',
+              // `flex: 1` on .pos-shell requires the flex parent to have a bounded height.
+              minWidth: 0,
             }}
           >
-            {safePage === 'dashboard'  && <Dashboard />}
-            {safePage === 'pos'        && <PointOfSale />}
-            {safePage === 'orders'     && <OrdersList />}
-            {safePage === 'menu'       && <MenuManager />}
-            {safePage === 'inventory'  && <Inventory />}
-            {safePage === 'analytics'  && <Analytics />}
-            {safePage === 'staff'      && <StaffManager />}
+            <ErrorBoundary label={PAGE_TITLES[safePage]} onRetry={() => setPage(safePage)}>
+              {safePage === 'dashboard'  && <Dashboard />}
+              {safePage === 'pos'        && <PointOfSale />}
+              {safePage === 'orders'     && <OrdersList />}
+              {safePage === 'menu'       && <MenuManager />}
+              {safePage === 'inventory'  && <Inventory />}
+              {safePage === 'analytics'  && <Analytics />}
+              {safePage === 'staff'      && <StaffManager />}
+              {safePage === 'settings'   && <Settings />}
+            </ErrorBoundary>
           </div>
         </main>
       </div>

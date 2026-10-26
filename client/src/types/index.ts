@@ -9,7 +9,24 @@ export interface StaffProfile {
   email: string
   role: StaffRole
   is_active: boolean
+  /** Public URL of the member's photo in the `avatars` bucket, if any. */
+  avatar_url?: string | null
+  /** Stamped by the heartbeat while the app is open — drives "online now". */
+  last_seen_at?: string | null
+  /** Stamped once per browser session, so it survives sign-out. */
+  last_sign_in_at?: string | null
+  /** `staff_profiles.id` of the admin who provisioned this account. */
+  created_by?: string | null
   created_at: string
+  updated_at?: string | null
+}
+
+/** Fields an administrator may change from the Edit Staff Member dialog. */
+export interface StaffUpdatePayload {
+  full_name?: string
+  email?: string
+  role?: StaffRole
+  is_active?: boolean
 }
 
 export interface ProductCategory {
@@ -29,14 +46,18 @@ export interface ProductRecipe {
   }
 }
 
+export type ProductType = 'Regular' | 'Bestseller' | 'New' | 'Seasonal' | 'Special'
+
 export interface Product {
   id: string
   name: string
   category_id: string
   category?: ProductCategory
   price: number
+  unit_cost?: number
   is_available: boolean
   image_url?: string
+  product_type?: ProductType
   recipes?: ProductRecipe[]
 }
 
@@ -74,8 +95,23 @@ export interface OrderItem {
   product_id: string
   product_name: string
   unit_price: number
+  unit_cost?: number
   quantity: number
   line_total: number
+}
+
+/**
+ * Running totals returned alongside a page of orders.
+ *
+ * Scoped to the caller — a cashier only ever totals their own orders — and
+ * deliberately unfiltered, so the figures describe their whole history rather
+ * than the current search or status tab.
+ */
+export interface OrderSummary {
+  /** Every transaction on record for this scope, voids included. */
+  transactions: number
+  /** Value of completed sales, voids excluded. */
+  sales: number
 }
 
 export interface CartItem extends Product {
@@ -120,40 +156,4 @@ export interface CreateInventoryItemPayload {
   unit_cost?: number
   supplier?: string
 }
-
-export interface CashierShift {
-  id: string
-  cashier_id: string
-  opening_float: number
-  closing_cash?: number | null
-  expected_cash?: number | null
-  cash_difference?: number | null
-  total_sales?: number
-  cash_sales?: number
-  gcash_sales?: number
-  card_sales?: number
-  orders_count?: number
-  status: 'open' | 'closed'
-  notes?: string | null
-  opened_at: string
-  closed_at?: string | null
-  cashier?: { full_name: string; email?: string }
-}
-
-export interface ShiftSummaryData {
-  cashier_name: string
-  opening_float: number
-  closing_cash: number
-  expected_cash: number
-  cash_difference: number
-  cash_sales: number
-  gcash_sales: number
-  card_sales: number
-  total_sales: number
-  orders_count: number
-  opened_at: string
-  closed_at: string
-  notes?: string | null
-}
-
 

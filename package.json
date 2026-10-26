@@ -2,13 +2,21 @@
   "name": "wingtrack",
   "version": "1.0.0",
   "private": true,
+  "description": "WINGTRACK — Integrated POS, Inventory & Sales Analytics. Root orchestrator only; all application code lives in client/ and server/.",
   "scripts": {
-    "dev:client": "cd client && npm run dev",
-    "dev:server": "cd server && npm run dev",
-    "dev": "concurrently \"npm run dev:client\" \"npm run dev:server\"",
-    "install:all": "cd client && npm install && cd ../server && npm install"
+    "dev": "concurrently -n client,server -c cyan,magenta \"npm run dev:client\" \"npm run dev:server\"",
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "npm --prefix server run dev",
+    "build": "npm --prefix client run build",
+    "build:server": "npm --prefix server run build",
+    "preview": "npm --prefix client run preview",
+    "install:all": "npm install && npm --prefix client install && npm --prefix server install",
+    "typecheck": "npm --prefix client exec -- tsc -b",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.5",
     "concurrently": "^9.0.0"
   }
 }

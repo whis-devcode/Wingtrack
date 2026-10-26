@@ -1,7 +1,14 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { useAuth } from '@/hooks/useAuth'
 import { apiUpdatePassword } from '@/lib/api'
+import { MIN_PASSWORD_LENGTH } from '@/lib/validation'
+import Avatar from '@/components/ui/Avatar'
+import ConfirmDialog from '@/components/ui/ConfirmDialog'
 import type { StaffRole } from '@/types'
+
+/** Below this width the sidebar becomes a slide-in drawer. */
+const DRAWER_BREAKPOINT = 1024
 
 type Page =
   | 'dashboard'
@@ -11,10 +18,19 @@ type Page =
   | 'inventory'
   | 'analytics'
   | 'staff'
+  | 'settings'
 
 interface NavItem {
   id: Page
   label: string
+  /**
+   * Label shown instead of `label` for a cashier.
+   *
+   * Transactions is a shared screen with two different meanings: an admin is
+   * auditing the whole store, a cashier is looking back over their own shift
+   * history. Same page, honest heading.
+   */
+  cashierLabel?: string
   roles: StaffRole[]
   icon: React.FC<{ active: boolean }>
 }
@@ -83,25 +99,56 @@ function StaffIcon({ active }: { active: boolean }) {
   )
 }
 
+function SettingsIcon({ active }: { active: boolean }) {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={active ? 'var(--sidebar-active)' : 'currentColor'} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  )
+}
 
 const NAV_ITEMS: NavItem[] = [
-  { id: 'dashboard', label: 'Dashboard',     roles: ['admin'],                       icon: DashIcon   },
-  { id: 'pos',       label: 'Point of Sale',  roles: ['admin', 'cashier'],            icon: PosIcon    },
-  { id: 'orders',    label: 'Transactions',   roles: ['admin'],                       icon: OrdersIcon },
-  { id: 'menu',      label: 'Menu Items',     roles: ['admin'],                       icon: MenuIcon   },
-  { id: 'inventory', label: 'Inventory',      roles: ['admin', 'inventory_personnel'], icon: InvIcon    },
-  { id: 'analytics', label: 'Analytics',      roles: ['admin'],                       icon: AnaIcon    },
-  { id: 'staff',     label: 'Staff Manager',  roles: ['admin'],                       icon: StaffIcon  },
+  { id: 'dashboard', label: 'Dashboard',     roles: ['admin'],                       icon: DashIcon     },
+  { id: 'pos',       label: 'Point of Sale',  roles: ['admin', 'cashier'],            icon: PosIcon      },
+  // Shared page. A cashier sees only their own orders (the server scopes the
+  // query by cashier_id), so the label says so rather than implying store-wide
+  // access they do not have.
+  { id: 'orders',    label: 'Transactions',   cashierLabel: 'My Transactions', roles: ['admin', 'cashier'], icon: OrdersIcon },
+  { id: 'menu',      label: 'Menu Items',     roles: ['admin'],                       icon: MenuIcon     },
+  { id: 'inventory', label: 'Inventory',      roles: ['admin', 'inventory_personnel'], icon: InvIcon      },
+  { id: 'analytics', label: 'Analytics',      roles: ['admin'],                       icon: AnaIcon      },
+  { id: 'staff',     label: 'Staff Manager',  roles: ['admin'],                       icon: StaffIcon    },
 ]
+
+/**
+ * Settings is deliberately NOT part of NAV_ITEMS.
+ *
+ * The main nav group is about running the store — selling, stock, staff. The
+ * settings rail is about the account and the app, so it is pinned to the
+ * bottom of the sidebar beside the signed-in user instead of scrolling away
+ * with the operational items.
+ *
+ * It is still for everyone: it holds your own profile and password. The User
+ * Accounts section inside it is admin-only.
+ */
+const SETTINGS_ITEM: NavItem = {
+  id: 'settings',
+  label: 'Settings',
+  roles: ['admin', 'cashier', 'inventory_personnel'],
+  icon: SettingsIcon,
+}
 
 interface SidebarProps {
   page: Page
   setPage: (p: Page) => void
-  isOpen?: boolean
-  onClose?: () => void
+  /** Whether the mobile drawer is open. Ignored on wide screens. */
+  mobileOpen?: boolean
+  /** Closes the mobile drawer. */
+  onCloseMobile?: () => void
 }
 
-export default function Sidebar({ page, setPage, isOpen = false, onClose }: SidebarProps) {
+export default function Sidebar({ page, setPage, mobileOpen = false, onCloseMobile }: SidebarProps) {
   const { profile, role, signOut } = useAuth()
   const [showPwdModal, setShowPwdModal] = useState(false)
   const [newPwd, setNewPwd] = useState('')
@@ -112,8 +159,88 @@ export default function Sidebar({ page, setPage, isOpen = false, onClose }: Side
   const [pwdSuccess, setPwdSuccess] = useState(false)
   const [pwdLoading, setPwdLoading] = useState(false)
   const [showSignOutConfirm, setShowSignOutConfirm] = useState(false)
+  /** True when the viewport is narrower than the drawer breakpoint. */
+  const [isNarrow, setIsNarrow] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth < DRAWER_BREAKPOINT,
+  )
+
+  // Track viewport width so the sidebar can switch between a fixed rail and a drawer.
+  useEffect(() => {
+    const query = window.matchMedia(`(max-width: ${DRAWER_BREAKPOINT - 1}px)`)
+    const sync = () => setIsNarrow(query.matches)
+    sync()
+    query.addEventListener('change', sync)
+    return () => query.removeEventListener('change', sync)
+  }, )
+
+  // Close the drawer with Escape.
+  useEffect(() => {
+    if (!isNarrow || !mobileOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCloseMobile?.()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [isNarrow, mobileOpen, onCloseMobile])
+
+  const drawerOpen = isNarrow && mobileOpen
 
   const visibleNav = NAV_ITEMS.filter(item => role && item.roles.includes(role))
+  const showSettings = !!role && SETTINGS_ITEM.roles.includes(role)
+  const hasDashboardAccess = !!role && (NAV_ITEMS.find(item => item.id === 'dashboard')?.roles.includes(role) ?? false)
+
+  function handleLogoClick() {
+    if (hasDashboardAccess) {
+      setPage('dashboard')
+      onCloseMobile?.()
+    }
+  }
+
+  /** One nav row. Shared so the pinned Settings button matches the main group. */
+  function renderNavButton({ id, label, cashierLabel, icon: Icon }: NavItem) {
+    const active = page === id
+    const text = role === 'cashier' && cashierLabel ? cashierLabel : label
+    return (
+      <button
+        key={id}
+        id={`nav-${id}`}
+        onClick={() => { setPage(id); onCloseMobile?.() }}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 13,
+          padding: '11px 16px',
+          borderRadius: 9,
+          border: 'none',
+          cursor: 'pointer',
+          fontFamily: 'Inter',
+          fontSize: 14,
+          fontWeight: active ? 600 : 500,
+          textAlign: 'left',
+          width: '100%',
+          transition: 'all 0.15s ease',
+          background: active ? 'rgba(235,165,79,0.14)' : 'transparent',
+          color: active ? 'var(--sidebar-active)' : 'var(--sidebar-muted)',
+          position: 'relative',
+        }}
+        onMouseEnter={e => {
+          if (!active) {
+            (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'
+            ;(e.currentTarget as HTMLElement).style.color = 'var(--sidebar-foreground)'
+          }
+        }}
+        onMouseLeave={e => {
+          if (!active) {
+            (e.currentTarget as HTMLElement).style.background = 'transparent'
+            ;(e.currentTarget as HTMLElement).style.color = 'var(--sidebar-muted)'
+          }
+        }}
+      >
+        <Icon active={active} />
+        {text}
+      </button>
+    )
+  }
 
   const roleLabel: Record<StaffRole, string> = {
     admin: 'Admin / Manager',
@@ -121,15 +248,11 @@ export default function Sidebar({ page, setPage, isOpen = false, onClose }: Side
     inventory_personnel: 'Inventory Personnel',
   }
 
-  const initials = profile?.full_name
-    ? profile.full_name.split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase()
-    : '?'
-
   async function handlePasswordChange(e: React.FormEvent) {
     e.preventDefault()
     setPwdError(null)
-    if (newPwd.length < 6) {
-      setPwdError('Password must be at least 6 characters.')
+    if (newPwd.length < MIN_PASSWORD_LENGTH) {
+      setPwdError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`)
       return
     }
     if (newPwd !== confirmPwd) {
@@ -155,286 +278,228 @@ export default function Sidebar({ page, setPage, isOpen = false, onClose }: Side
   }
 
   return (
-    <aside
-      className={`fixed lg:static top-0 left-0 bottom-0 z-50 transition-transform duration-300 ease-in-out shadow-2xl lg:shadow-none ${
-        isOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
-      }`}
-      style={{
-        background: 'var(--sidebar)',
-        display: 'flex',
-        flexDirection: 'column',
-        height: '100dvh',
-        width: 280,
-        maxWidth: '85vw',
-        flexShrink: 0,
-      }}
-    >
-      {/* Brand */}
-      <div style={{ padding: '22px 20px 20px', borderBottom: '1px solid rgba(255,255,255,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+    <>
+      {/* Mobile backdrop — dims the page behind the open drawer */}
+      {drawerOpen && (
         <div
-          id="brand-logo-btn"
-          role="button"
-          tabIndex={0}
-          onClick={() => {
-            setPage('dashboard')
-            onClose?.()
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              setPage('dashboard')
-              onClose?.()
-            }
-          }}
+          onClick={onCloseMobile}
+          aria-hidden="true"
           style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 12,
-            cursor: 'pointer',
-            userSelect: 'none',
-            borderRadius: 8,
-            transition: 'opacity 0.15s ease',
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.5)',
+            backdropFilter: 'blur(2px)',
+            WebkitBackdropFilter: 'blur(2px)',
+            zIndex: 190,
           }}
-          onMouseEnter={e => (e.currentTarget.style.opacity = '0.85')}
-          onMouseLeave={e => (e.currentTarget.style.opacity = '1')}
-          title="Go to Dashboard"
-        >
-          <div
-            id="brand-logo-img-wrapper"
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: '50%',
-              overflow: 'hidden',
-              flexShrink: 0,
-              boxShadow: '0 4px 14px rgba(234,88,12,0.3)',
-              border: '2px solid rgba(249,115,22,0.4)',
-              background: '#ea580c',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <img
-              src="/logo.png"
-              alt="Wingtrack Logo"
-              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-            />
-          </div>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ fontFamily: 'Fraunces', fontSize: 21, fontWeight: 700, color: 'var(--sidebar-foreground)', letterSpacing: '-0.01em' }}>
-                WINGTRACK
-              </span>
-            </div>
-            <span style={{ fontFamily: 'DM Mono', fontSize: 10, color: 'var(--sidebar-active)', letterSpacing: '0.12em', textTransform: 'uppercase', fontWeight: 600 }}>
-              POS & INVENTORY
-            </span>
-          </div>
-        </div>
+        />
+      )}
 
-        {onClose && (
-          <button
-            id="sidebar-close-btn"
-            onClick={onClose}
-            className="lg:hidden"
-            style={{
-              background: 'rgba(255,255,255,0.08)',
-              border: 'none',
-              color: 'var(--sidebar-muted)',
-              cursor: 'pointer',
-              padding: '8px',
-              borderRadius: 8,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-            aria-label="Close sidebar"
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18"/>
-              <line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
-        )}
-      </div>
-
-      {/* Nav */}
-      <nav style={{ flex: 1, padding: '16px 12px', display: 'flex', flexDirection: 'column', gap: 4, overflowY: 'auto' }}>
-        {visibleNav.map(({ id, label, icon: Icon }) => {
-          const active = page === id
-          return (
-            <button
-              key={id}
-              id={`nav-${id}`}
-              onClick={() => {
-                setPage(id)
-                onClose?.()
-              }}
+      <aside
+        className="sidebar-rail"
+        style={{
+          background: 'var(--sidebar)',
+          display: 'flex',
+          flexDirection: 'column',
+          height: '100dvh',
+          width: 280,
+          flexShrink: 0,
+          ...(isNarrow
+            ? {
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                zIndex: 200,
+                transform: drawerOpen ? 'translateX(0)' : 'translateX(-100%)',
+                transition: 'transform 0.24s cubic-bezier(0.4, 0, 0.2, 1)',
+                boxShadow: drawerOpen ? '0 0 40px rgba(0,0,0,0.4)' : 'none',
+              }
+            : {}),
+        }}
+      >
+        {/* Brand */}
+        <div style={{ padding: '26px 24px 22px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div
+              id="sidebar-brand-btn"
+              onClick={hasDashboardAccess ? handleLogoClick : undefined}
+              role={hasDashboardAccess ? 'button' : undefined}
+              tabIndex={hasDashboardAccess ? 0 : undefined}
+              onKeyDown={hasDashboardAccess ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  handleLogoClick()
+                }
+              } : undefined}
+              aria-label={hasDashboardAccess ? 'Go to Dashboard' : undefined}
+              title={hasDashboardAccess ? 'Go to Dashboard' : undefined}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: 13,
-                padding: '11px 16px',
-                borderRadius: 9,
-                border: 'none',
-                cursor: 'pointer',
-                fontFamily: 'DM Sans',
-                fontSize: 14,
-                fontWeight: active ? 600 : 500,
-                textAlign: 'left',
-                width: '100%',
-                transition: 'all 0.15s ease',
-                background: active ? 'rgba(235,165,79,0.14)' : 'transparent',
-                color: active ? 'var(--sidebar-active)' : 'var(--sidebar-muted)',
-                position: 'relative',
+                gap: 12,
+                flex: 1,
+                minWidth: 0,
+                cursor: hasDashboardAccess ? 'pointer' : 'default',
+                userSelect: 'none',
+                transition: 'opacity 0.15s ease',
               }}
               onMouseEnter={e => {
-                if (!active) {
-                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'
-                  ;(e.currentTarget as HTMLElement).style.color = 'var(--sidebar-foreground)'
+                if (hasDashboardAccess) {
+                  (e.currentTarget as HTMLElement).style.opacity = '0.82'
                 }
               }}
               onMouseLeave={e => {
-                if (!active) {
-                  (e.currentTarget as HTMLElement).style.background = 'transparent'
-                  ;(e.currentTarget as HTMLElement).style.color = 'var(--sidebar-muted)'
+                if (hasDashboardAccess) {
+                  (e.currentTarget as HTMLElement).style.opacity = '1'
                 }
               }}
             >
-              <Icon active={active} />
-              {label}
-            </button>
-          )
-        })}
-      </nav>
+              <div
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: '50%',
+                  overflow: 'hidden',
+                  flexShrink: 0,
+                  boxShadow: '0 4px 14px rgba(234,88,12,0.3)',
+                  border: '2px solid rgba(249,115,22,0.4)',
+                  background: '#ea580c',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  transition: 'transform 0.15s ease',
+                }}
+              >
+                <img
+                  src="/logo.png"
+                  alt="Wingtrack Logo"
+                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontFamily: 'Inter', fontSize: 21, fontWeight: 800, color: 'var(--sidebar-foreground)', letterSpacing: '-0.03em' }}>
+                    WINGTRACK
+                  </span>
+                </div>
+                <span style={{ fontFamily: 'IBM Plex Mono', fontSize: 10, color: 'var(--sidebar-active)', letterSpacing: '0.12em', textTransform: 'uppercase', fontWeight: 600 }}>
+                  POS &amp; INVENTORY
+                </span>
+              </div>
+            </div>
+            {isNarrow && (
+              <button
+                type="button"
+                onClick={onCloseMobile}
+                aria-label="Close navigation menu"
+                style={{
+                  background: 'transparent', border: 'none', cursor: 'pointer', padding: 6,
+                  color: 'var(--sidebar-muted)', display: 'flex', alignItems: 'center',
+                }}
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
 
-      {/* User + Sign Out */}
-      <div style={{ padding: '18px 14px', borderTop: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 8 }}>
-          <div
-            style={{
-              width: 40, height: 40, borderRadius: '50%',
-              background: 'var(--primary)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 14, fontWeight: 700, color: '#fdfaf6', flexShrink: 0,
-            }}
-          >
-            {initials}
+        {/* Nav */}
+        <nav style={{ flex: 1, overflowY: 'auto', padding: '16px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {visibleNav.map(renderNavButton)}
+        </nav>
+
+      {/* Bottom stack: the pinned Settings rail, then the account block.
+          One border-top covers both so the sidebar reads as a single footer. */}
+      <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
+        {showSettings && (
+          <div style={{ padding: '12px 12px 0' }}>{renderNavButton(SETTINGS_ITEM)}</div>
+        )}
+
+        <div style={{ padding: '14px 14px 18px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 8 }}>
+            {/* The signed-in user's own photo, falling back to initials. */}
+            <Avatar name={profile?.full_name} src={profile?.avatar_url} size={40} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--sidebar-foreground)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {profile?.full_name ?? 'Staff'}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--sidebar-muted)', fontWeight: 500 }}>
+                {role ? roleLabel[role] : ''}
+              </p>
+            </div>
           </div>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--sidebar-foreground)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {profile?.full_name ?? 'Staff'}
-            </p>
-            <p style={{ fontSize: 11, color: 'var(--sidebar-muted)', fontWeight: 500 }}>
-              {role ? roleLabel[role] : ''}
-            </p>
-          </div>
+
           <button
-            onClick={() => { setShowPwdModal(true); setPwdError(null); setPwdSuccess(false) }}
-            title="Change password"
+            id="btn-signout"
+            onClick={() => setShowSignOutConfirm(true)}
             style={{
-              background: 'transparent', border: 'none', color: 'var(--sidebar-muted)',
-              cursor: 'pointer', padding: 6, borderRadius: 6, display: 'flex', alignItems: 'center',
+              width: '100%', marginTop: 8, padding: '10px', background: 'transparent',
+              border: '1px solid rgba(255,255,255,0.14)', borderRadius: 8,
+              fontSize: 13, color: 'var(--sidebar-muted)', cursor: 'pointer',
+              fontFamily: 'Inter', fontWeight: 500, transition: 'all 0.15s',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7,
             }}
-            onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = 'var(--sidebar-foreground)'}
-            onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = 'var(--sidebar-muted)'}
+            onMouseEnter={e => {
+              (e.currentTarget as HTMLElement).style.background = 'rgba(185,28,28,0.16)'
+              ;(e.currentTarget as HTMLElement).style.color = '#fca5a5'
+              ;(e.currentTarget as HTMLElement).style.borderColor = 'rgba(252,165,165,0.3)'
+            }}
+            onMouseLeave={e => {
+              (e.currentTarget as HTMLElement).style.background = 'transparent'
+              ;(e.currentTarget as HTMLElement).style.color = 'var(--sidebar-muted)'
+              ;(e.currentTarget as HTMLElement).style.borderColor = 'rgba(255,255,255,0.14)'
+            }}
           >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
             </svg>
+            Sign Out
           </button>
         </div>
-
-        <button
-          id="btn-signout"
-          onClick={() => setShowSignOutConfirm(true)}
-          style={{
-            width: '100%', marginTop: 8, padding: '10px', background: 'transparent',
-            border: '1px solid rgba(255,255,255,0.14)', borderRadius: 8,
-            fontSize: 13, color: 'var(--sidebar-muted)', cursor: 'pointer',
-            fontFamily: 'DM Sans', fontWeight: 500, transition: 'all 0.15s',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7,
-          }}
-          onMouseEnter={e => {
-            (e.currentTarget as HTMLElement).style.background = 'rgba(185,28,28,0.16)'
-            ;(e.currentTarget as HTMLElement).style.color = '#fca5a5'
-            ;(e.currentTarget as HTMLElement).style.borderColor = 'rgba(252,165,165,0.3)'
-          }}
-          onMouseLeave={e => {
-            (e.currentTarget as HTMLElement).style.background = 'transparent'
-            ;(e.currentTarget as HTMLElement).style.color = 'var(--sidebar-muted)'
-            ;(e.currentTarget as HTMLElement).style.borderColor = 'rgba(255,255,255,0.14)'
-          }}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-            <polyline points="16 17 21 12 16 7"/>
-            <line x1="21" y1="12" x2="9" y2="12"/>
-          </svg>
-          Sign Out
-        </button>
       </div>
 
-      {/* Sign Out Confirmation Modal */}
-      {showSignOutConfirm && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)',
-            backdropFilter: 'blur(4px)', WebkitBackdropFilter: 'blur(4px)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 400,
-          }}
-          onClick={e => { if (e.target === e.currentTarget) setShowSignOutConfirm(false) }}
-        >
-          <div className="card fade-in" style={{ width: '100%', maxWidth: 360, padding: '28px 26px', textAlign: 'center', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
-            <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'rgba(185,28,28,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#b91c1c" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-                <polyline points="16 17 21 12 16 7"/>
-                <line x1="21" y1="12" x2="9" y2="12"/>
-              </svg>
-            </div>
-            <h3 style={{ fontFamily: 'Fraunces', fontSize: 18, fontWeight: 700, color: 'var(--foreground)', marginBottom: 8 }}>Sign Out?</h3>
-            <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 22 }}>You will be logged out of your current session. Any unsaved changes will be lost.</p>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button
-                id="btn-signout-cancel"
-                onClick={() => setShowSignOutConfirm(false)}
-                className="btn-ghost"
-                style={{ flex: 1, padding: '10px' }}
-              >
-                Cancel
-              </button>
-              <button
-                id="btn-signout-confirm"
-                onClick={() => { setShowSignOutConfirm(false); signOut() }}
-                style={{
-                  flex: 1, padding: '10px', borderRadius: 8, border: 'none',
-                  background: '#b91c1c', color: '#fff', fontSize: 13, fontWeight: 600,
-                  cursor: 'pointer', fontFamily: 'DM Sans', transition: 'all 0.15s',
-                }}
-                onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#991b1b'}
-                onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = '#b91c1c'}
-              >
-                Yes, Sign Out
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/*
+        Sign-out confirmation.
 
-      {/* Change Password Modal */}
-      {showPwdModal && (
+        This was previously a hand-rolled modal rendered inline right here, and
+        it was invisible: `.sidebar-rail` sets `isolation: isolate` (so the
+        motif pseudo-element can sit at z-index -1 without dropping behind the
+        page), which makes the rail its own stacking context. A z-index on a
+        descendant is then scoped *inside* that context, so the overlay painted
+        underneath the main content — clicking "Sign Out" appeared to do
+        nothing. ConfirmDialog portals to document.body, which escapes the rail
+        entirely; every other dialog in the app already does this.
+      */}
+      <ConfirmDialog
+        open={showSignOutConfirm}
+        tone="danger"
+        title="Sign out?"
+        message="You will be returned to the sign-in screen. Anything you have not saved will be lost."
+        confirmLabel="Yes, sign out"
+        cancelLabel="Cancel"
+        onConfirm={() => { setShowSignOutConfirm(false); signOut() }}
+        onCancel={() => setShowSignOutConfirm(false)}
+      />
+
+      {/* Change Password Modal — portalled for the same reason as the dialog
+          above: a fixed overlay rendered inside the rail's stacking context
+          paints behind the page, not over it. */}
+      {showPwdModal && typeof document !== 'undefined' && createPortal(
         <div
           style={{
             position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 300,
+            backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999,
           }}
           onClick={e => { if (e.target === e.currentTarget) setShowPwdModal(false) }}
         >
-          <div className="card fade-in" style={{ width: '100%', maxWidth: 380, padding: '26px' }}>
-            <h3 style={{ fontFamily: 'Fraunces', fontSize: 18, color: 'var(--foreground)', marginBottom: 8 }}>
+          <div className="card fade-in" style={{ width: '100%', maxWidth: 380, maxHeight: '90dvh', overflowY: 'auto', padding: '26px' }}>
+            <h3 style={{ fontFamily: 'Inter', fontSize: 18, color: 'var(--foreground)', marginBottom: 8 }}>
               Change Your Password
             </h3>
             <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 16 }}>
@@ -451,7 +516,7 @@ export default function Sidebar({ page, setPage, isOpen = false, onClose }: Side
                     className="input"
                     type={showNewPwd ? 'text' : 'password'}
                     required
-                    placeholder="Min 6 characters"
+                    placeholder={`Min ${MIN_PASSWORD_LENGTH} characters`}
                     value={newPwd}
                     onChange={e => setNewPwd(e.target.value)}
                     style={{ width: '100%', padding: '9px 36px 9px 12px', fontSize: 13 }}
@@ -572,9 +637,11 @@ export default function Sidebar({ page, setPage, isOpen = false, onClose }: Side
               </div>
             </form>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
-    </aside>
+      </aside>
+    </>
   )
 }
 

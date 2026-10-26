@@ -2,6 +2,9 @@ import { useEffect, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '@/lib/supabase'
 import { apiAdjustInventory, apiGetInventoryMovements, apiCreateInventoryItem } from '@/lib/api'
+import { dispatchNotification } from '@/lib/notifications'
+import { useIsCompact } from '@/hooks/useMediaQuery'
+import EmptyState, { EMPTY_ICONS } from '@/components/ui/EmptyState'
 import type { InventoryItem, InventoryAdjustmentPayload, InventoryMovement } from '@/types'
 
 const CATS = ['All', 'Proteins', 'Sauces', 'Sides', 'Produce', 'Cooking', 'Spices', 'Staples', 'Packaging']
@@ -28,7 +31,134 @@ interface AdjustModal {
   type: 'restock' | 'adjustment' | 'waste'
 }
 
+/** Read-only label/value pair used throughout the mobile inventory cards. */
+function Field({ label, value, mono, color }: { label: string; value: React.ReactNode; mono?: boolean; color?: string }) {
+  return (
+    <div style={{ minWidth: 0 }}>
+      <p style={{ fontSize: 10, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>
+        {label}
+      </p>
+      <p style={{ fontSize: 13, fontWeight: 600, fontFamily: mono ? 'IBM Plex Mono' : undefined, color: color ?? 'var(--foreground)', overflowWrap: 'anywhere' }}>
+        {value}
+      </p>
+    </div>
+  )
+}
+
+/**
+ * Phone-width presentation of a stock item — mirrors all eight columns of the
+ * desktop grid (name, unit, stock, min level, cost, supplier, status, action).
+ */
+function InventoryCard({
+  item,
+  onAdjust,
+}: {
+  item: InventoryItem
+  onAdjust: () => void
+}) {
+  const status = getItemStatus(item)
+  const s = STATUS_STYLES[status] ?? STATUS_STYLES.ok
+  const qtyColor = status === 'ok' ? 'var(--success, #15803d)' : status === 'low' ? '#b45309' : '#b91c1c'
+
+  return (
+    <div className="card" style={{ padding: '14px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 12 }}>
+        <div style={{ minWidth: 0 }}>
+          <p style={{ fontSize: 15, fontWeight: 600, color: 'var(--foreground)', overflowWrap: 'anywhere' }}>{item.name}</p>
+          <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginTop: 2 }}>{item.category}</p>
+        </div>
+        <span
+          style={{
+            fontSize: 11, padding: '4px 10px', borderRadius: 20, fontWeight: 700,
+            background: s.bg, color: s.color, whiteSpace: 'nowrap', flexShrink: 0,
+          }}
+        >
+          {s.label}
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+        <Field label={`In Stock (${item.unit})`} value={Number(item.stock_qty).toLocaleString()} mono color={qtyColor} />
+        <Field label={`Min Level (${item.unit})`} value={Number(item.min_stock_level).toLocaleString()} mono />
+        <Field label="Unit Cost" value={`\u20B1${Number(item.unit_cost).toLocaleString()}`} mono />
+        <Field label="Supplier" value={item.supplier ?? '-'} />
+      </div>
+
+      <button
+        type="button"
+        id={`inv-restock-${item.id}`}
+        onClick={onAdjust}
+        style={{
+          width: '100%', fontSize: 13, padding: '10px 12px', borderRadius: 8,
+          border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--primary)',
+          cursor: 'pointer', fontWeight: 600,
+        }}
+      >
+        Adjust Stock
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Phone-width presentation of an audit movement — mirrors all seven columns
+ * (timestamp, item, type, change, before → after, staff, notes).
+ */
+function MovementCard({ m }: { m: InventoryMovement }) {
+  const dateStr = new Date(m.created_at).toLocaleString('en-PH', {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+  })
+  const isPositive = m.qty_change > 0
+  const typeColor = m.movement_type === 'restock' ? '#15803d' : m.movement_type === 'deduction' ? '#c47a2e' : m.movement_type === 'waste' ? '#b91c1c' : '#4b5563'
+  const typeBg = m.movement_type === 'restock' ? '#e8f5e9' : m.movement_type === 'deduction' ? '#fff7ed' : m.movement_type === 'waste' ? '#fce8e8' : '#f3f4f6'
+
+  return (
+    <div className="card" style={{ padding: '14px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <p style={{ fontSize: 15, fontWeight: 600, color: 'var(--foreground)', overflowWrap: 'anywhere' }}>
+            {m.inventory?.name ?? 'Unknown item'}
+          </p>
+          <p style={{ fontSize: 11, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', marginTop: 2 }}>
+            {dateStr}
+          </p>
+        </div>
+        <span
+          style={{
+            fontSize: 10, padding: '3px 8px', borderRadius: 12, background: typeBg,
+            color: typeColor, textTransform: 'uppercase', fontWeight: 700,
+            whiteSpace: 'nowrap', flexShrink: 0,
+          }}
+        >
+          {m.movement_type}
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: m.notes ? 10 : 0 }}>
+        <Field
+          label="Change"
+          value={`${isPositive ? '+' : ''}${m.qty_change} ${m.inventory?.unit ?? ''}`}
+          mono
+          color={isPositive ? '#15803d' : '#b91c1c'}
+        />
+        <Field label="Before → After" value={`${Number(m.qty_before).toFixed(1)} → ${Number(m.qty_after).toFixed(1)}`} mono color="var(--muted-foreground)" />
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--muted)' }}>
+        <span style={{ fontSize: 12, color: 'var(--foreground)' }}>{m.staff?.full_name ?? 'System'}</span>
+        {m.notes && (
+          <span style={{ fontSize: 12, color: 'var(--muted-foreground)', textAlign: 'right', overflowWrap: 'anywhere' }}>
+            {m.notes}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function Inventory() {
+  /** Phones get card lists; wider viewports keep the wide grids. */
+  const isCompact = useIsCompact()
   const [activeTab, setActiveTab] = useState<'stock' | 'movements'>('stock')
   const [items, setItems] = useState<InventoryItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -63,21 +193,16 @@ export default function Inventory() {
   // Export state
   const [exportFilter, setExportFilter] = useState<'week' | 'month'>('week')
   const [showExportMenu, setShowExportMenu] = useState(false)
-  const [reportModalData, setReportModalData] = useState<{
-    periodLabel: string
-    generatedAt: string
-    records: InventoryMovement[]
-  } | null>(null)
 
   useEffect(() => {
-    if (adjustModal || showAddModal || reportModalData) {
+    if (adjustModal || showAddModal) {
       const prev = document.body.style.overflow
       document.body.style.overflow = 'hidden'
       return () => {
         document.body.style.overflow = prev
       }
     }
-  }, [adjustModal, showAddModal, reportModalData])
+  }, [adjustModal, showAddModal])
 
   const fetchInventory = useCallback(async () => {
     const { data, error } = await supabase
@@ -155,11 +280,21 @@ export default function Inventory() {
 
     try {
       await apiAdjustInventory(payload)
+      const adjustedItemName = adjustModal.item.name
+      const adjustedType = adjustModal.type
+      const adjustedUnit = adjustModal.item.unit
       setAdjustModal(null)
       setAdjustQty('')
       setAdjustNotes('')
       await fetchInventory()
       if (activeTab === 'movements') await fetchMovements()
+
+      // Broadcast inventory notification to Dashboard & all windows
+      dispatchNotification({
+        category: 'inventory',
+        title: adjustedType === 'restock' ? 'Inventory Restocked' : adjustedType === 'waste' ? 'Waste Recorded' : 'Inventory Adjusted',
+        body: `${adjustedItemName}: ${adjustedType === 'restock' ? '+' : ''}${qtyChange} ${adjustedUnit} (${adjustNotes || 'Manual update'})`,
+      })
     } catch (err: unknown) {
       setAdjustError(err instanceof Error ? err.message : 'Adjustment failed')
     } finally {
@@ -171,10 +306,12 @@ export default function Inventory() {
     e.preventDefault()
     setAddError(null)
     setAddLoading(true)
+    const createdName = newItemName.trim()
+    const createdCat = newItemCat
     try {
       await apiCreateInventoryItem({
-        name: newItemName.trim(),
-        category: newItemCat,
+        name: createdName,
+        category: createdCat,
         unit: newItemUnit.trim(),
         stock_qty: newItemStock ? parseFloat(newItemStock) : 0,
         min_stock_level: newItemMin ? parseFloat(newItemMin) : 0,
@@ -188,6 +325,13 @@ export default function Inventory() {
       setNewItemCost('')
       setNewItemSupplier('')
       await fetchInventory()
+
+      // Broadcast new item notification
+      dispatchNotification({
+        category: 'inventory',
+        title: 'New Inventory Item',
+        body: `${createdName} (${createdCat}) was added to inventory.`,
+      })
     } catch (err: unknown) {
       setAddError(err instanceof Error ? err.message : 'Failed to add item')
     } finally {
@@ -208,25 +352,67 @@ export default function Inventory() {
     const filtered = movements.filter(m => new Date(m.created_at) >= cutoff)
     const periodLabel = period === 'week' ? 'Last 7 Days' : 'Last 30 Days'
 
-    setReportModalData({
-      periodLabel,
-      generatedAt: now.toLocaleString('en-PH', {
+    const rows = filtered.map(m => {
+      const dateStr = new Date(m.created_at).toLocaleString('en-PH', {
         month: 'short', day: 'numeric', year: 'numeric',
         hour: 'numeric', minute: '2-digit', hour12: true,
-      }),
-      records: filtered,
-    })
+      })
+      const changeStr = m.qty_change > 0 ? `+${m.qty_change}` : String(m.qty_change)
+      return `
+        <tr>
+          <td>${dateStr}</td>
+          <td>${m.inventory?.name ?? 'Unknown'}</td>
+          <td style="text-transform:capitalize">${m.movement_type}</td>
+          <td style="color:${m.qty_change > 0 ? '#15803d' : '#b91c1c'}">${changeStr} ${m.inventory?.unit ?? ''}</td>
+          <td>${Number(m.qty_before).toFixed(2)} → ${Number(m.qty_after).toFixed(2)}</td>
+          <td>${m.staff?.full_name ?? 'System'}</td>
+          <td>${m.notes || '-'}</td>
+        </tr>`
+    }).join('')
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <title>Inventory Report – ${periodLabel}</title>
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 12px; color: #111; padding: 24px; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    p.meta { color: #666; font-size: 11px; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { background: #f3f4f6; text-align: left; padding: 8px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #e5e7eb; }
+    td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    @media print { body { padding: 0; } }
+  </style>
+</head>
+<body>
+  <h1>WINGTRACK — Inventory Movement Report</h1>
+  <p class="meta">Period: ${periodLabel} &nbsp;|&nbsp; Generated: ${now.toLocaleString('en-PH')} &nbsp;|&nbsp; ${filtered.length} record(s)</p>
+  <table>
+    <thead><tr><th>Timestamp</th><th>Item</th><th>Type</th><th>Change</th><th>Before → After</th><th>Staff</th><th>Notes</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="7" style="text-align:center;color:#888;padding:20px">No records for this period.</td></tr>'}</tbody>
+  </table>
+</body>
+</html>`
+
+    const win = window.open('', '_blank')
+    if (win) {
+      win.document.write(html)
+      win.document.close()
+      win.focus()
+      setTimeout(() => win.print(), 400)
+    }
   }
 
   return (
-    <div style={{ padding: 'clamp(16px, 4vw, 28px) clamp(16px, 5vw, 36px)', minHeight: '100vh' }}>
+    <div className="page">
       {/* Header */}
       <div style={{ marginBottom: 20, display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
         <div>
-          <h1 style={{ fontFamily: 'Fraunces', fontSize: 26, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
+          <h1 className="page-title" style={{ fontSize: 26 }}>
             Inventory Management
           </h1>
-          <p style={{ fontSize: 13, color: 'var(--muted-foreground)' }}>
+          <p className="page-subtitle">
             {items.length} raw ingredients & packaging items · Real-time stock tracking
           </p>
         </div>
@@ -506,12 +692,28 @@ export default function Inventory() {
             <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 60 }}>
               <div className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
             </div>
+          ) : isCompact ? (
+            /* Phones: the 920px grid hid half the columns off-screen. */
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {filtered.map(item => (
+                <InventoryCard
+                  key={item.id}
+                  item={item}
+                  onAdjust={() => { setAdjustModal({ item, type: 'restock' }); setAdjustQty(''); setAdjustNotes('') }}
+                />
+              ))}
+              {filtered.length === 0 && (
+                <div className="card" style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--muted-foreground)', fontSize: 14 }}>
+                  No items match your filter.
+                </div>
+              )}
+            </div>
           ) : (
             <div className="card" style={{ overflow: 'hidden' }}>
-              <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' as const }}>
-              <div style={{ minWidth: 760, display: 'grid', gridTemplateColumns: '2fr 80px 105px 105px 115px 150px 90px 110px', gap: 0, padding: '12px 22px', borderBottom: '1px solid var(--border)' }}>
+              <div className="scroll-x">
+              <div style={{ display: 'grid', gridTemplateColumns: '2fr 80px 105px 105px 115px 150px 90px 110px', gap: 0, padding: '12px 22px', borderBottom: '1px solid var(--border)', minWidth: 920 }}>
                 {['Item Name', 'Unit', 'In Stock', 'Min Level', 'Unit Cost', 'Supplier', 'Status', 'Actions'].map(h => (
-                  <span key={h} style={{ fontSize: 11, fontFamily: 'DM Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</span>
+                  <span key={h} style={{ fontSize: 11, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</span>
                 ))}
               </div>
               {filtered.map((item, i) => {
@@ -523,9 +725,8 @@ export default function Inventory() {
                     key={item.id}
                     style={{
                       display: 'grid', gridTemplateColumns: '2fr 80px 105px 105px 115px 150px 90px 110px', gap: 0,
-                      minWidth: 760,
                       padding: '14px 22px', borderBottom: i < filtered.length - 1 ? '1px solid var(--muted)' : 'none',
-                      alignItems: 'center', transition: 'background 0.1s',
+                      alignItems: 'center', transition: 'background 0.1s', minWidth: 920,
                     }}
                     onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--muted)'}
                     onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
@@ -534,10 +735,10 @@ export default function Inventory() {
                       <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--foreground)' }}>{item.name}</p>
                       <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginTop: 2 }}>{item.category}</p>
                     </div>
-                    <span style={{ fontSize: 13, color: 'var(--muted-foreground)', fontFamily: 'DM Mono' }}>{item.unit}</span>
-                    <span style={{ fontSize: 14, fontFamily: 'DM Mono', fontWeight: 700, color: qtyColor }}>{Number(item.stock_qty).toLocaleString()}</span>
-                    <span style={{ fontSize: 13, fontFamily: 'DM Mono', color: 'var(--muted-foreground)' }}>{Number(item.min_stock_level).toLocaleString()}</span>
-                    <span style={{ fontSize: 13, fontFamily: 'DM Mono', color: 'var(--foreground)' }}>&#8369;{Number(item.unit_cost).toLocaleString()}</span>
+                    <span style={{ fontSize: 13, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono' }}>{item.unit}</span>
+                    <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: qtyColor }}>{Number(item.stock_qty).toLocaleString()}</span>
+                    <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)' }}>{Number(item.min_stock_level).toLocaleString()}</span>
+                    <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono', color: 'var(--foreground)' }}>&#8369;{Number(item.unit_cost).toLocaleString()}</span>
                     <span style={{ fontSize: 12, color: 'var(--muted-foreground)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.supplier ?? '-'}</span>
                     <span style={{ fontSize: 12, padding: '4px 10px', borderRadius: 20, fontWeight: 700, background: s.bg, color: s.color, textAlign: 'center', display: 'inline-block' }}>{s.label}</span>
                     <div style={{ display: 'flex', gap: 6 }}>
@@ -553,7 +754,12 @@ export default function Inventory() {
                 )
               })}
               {filtered.length === 0 && (
-                <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--muted-foreground)', fontSize: 14 }}>No items match your filter.</div>
+                <EmptyState
+                  compact
+                  icon={EMPTY_ICONS.search}
+                  title="No items match your filter"
+                  hint="Try clearing the search box or choosing a different category."
+                />
               )}
               </div>
             </div>
@@ -570,12 +776,22 @@ export default function Inventory() {
             <div style={{ padding: '14px', background: '#fee2e2', color: '#b91c1c', borderRadius: 8, fontSize: 13 }}>
               {movementsError}
             </div>
+          ) : isCompact ? (
+            /* Phones: the 940px audit grid did not fit at all. */
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {movements.map(m => <MovementCard key={m.id} m={m} />)}
+              {movements.length === 0 && (
+                <div className="card" style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--muted-foreground)', fontSize: 14 }}>
+                  No inventory movements recorded yet.
+                </div>
+              )}
+            </div>
           ) : (
             <div className="card" style={{ overflow: 'hidden' }}>
-              <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' as const }}>
-              <div style={{ minWidth: 820, display: 'grid', gridTemplateColumns: '150px 200px 110px 100px 140px 140px 1fr', gap: 0, padding: '12px 20px', borderBottom: '1px solid var(--border)' }}>
+              <div className="scroll-x">
+              <div style={{ display: 'grid', gridTemplateColumns: '150px 200px 110px 100px 140px 140px 1fr', gap: 0, padding: '12px 20px', borderBottom: '1px solid var(--border)', minWidth: 940 }}>
                 {['Timestamp', 'Item', 'Type', 'Change', 'Before → After', 'Staff', 'Notes'].map(h => (
-                  <span key={h} style={{ fontSize: 11, fontFamily: 'DM Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</span>
+                  <span key={h} style={{ fontSize: 11, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</span>
                 ))}
               </div>
               {movements.map((m, i) => {
@@ -595,22 +811,21 @@ export default function Inventory() {
                     key={m.id}
                     style={{
                       display: 'grid', gridTemplateColumns: '150px 200px 110px 100px 140px 140px 1fr', gap: 0,
-                      minWidth: 820,
                       padding: '12px 20px', borderBottom: i < movements.length - 1 ? '1px solid var(--muted)' : 'none',
-                      alignItems: 'center', fontSize: 13,
+                      alignItems: 'center', fontSize: 13, minWidth: 940,
                     }}
                   >
-                    <span style={{ fontSize: 12, fontFamily: 'DM Mono', color: 'var(--muted-foreground)' }}>{dateStr}</span>
+                    <span style={{ fontSize: 12, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)' }}>{dateStr}</span>
                     <span style={{ fontWeight: 600, color: 'var(--foreground)' }}>{m.inventory?.name ?? 'Unknown item'}</span>
                     <div>
                       <span style={{ fontSize: 11, padding: '3px 8px', borderRadius: 12, background: typeBg, color: typeColor, textTransform: 'uppercase', fontWeight: 700 }}>
                         {m.movement_type}
                       </span>
                     </div>
-                    <span style={{ fontFamily: 'DM Mono', fontWeight: 700, color: isPositive ? '#15803d' : '#b91c1c' }}>
+                    <span style={{ fontFamily: 'IBM Plex Mono', fontWeight: 700, color: isPositive ? '#15803d' : '#b91c1c' }}>
                       {isPositive ? `+${m.qty_change}` : m.qty_change} {m.inventory?.unit ?? ''}
                     </span>
-                    <span style={{ fontFamily: 'DM Mono', fontSize: 12, color: 'var(--muted-foreground)' }}>
+                    <span style={{ fontFamily: 'IBM Plex Mono', fontSize: 12, color: 'var(--muted-foreground)' }}>
                       {Number(m.qty_before).toFixed(1)} → {Number(m.qty_after).toFixed(1)}
                     </span>
                     <span style={{ fontSize: 12, color: 'var(--foreground)' }}>
@@ -653,8 +868,8 @@ export default function Inventory() {
           }}
           onClick={e => { if (e.target === e.currentTarget) setAdjustModal(null) }}
         >
-          <div className="card fade-in" style={{ width: '100%', maxWidth: 440, padding: 'clamp(18px, 4vw, 30px) clamp(16px, 4vw, 26px)', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
-            <h2 style={{ fontFamily: 'Fraunces', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
+          <div className="card fade-in" style={{ width: '100%', maxWidth: 440, padding: '30px 26px', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
+            <h2 style={{ fontFamily: 'Inter', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
               {adjustModal.type === 'restock' ? 'Restock' : adjustModal.type === 'waste' ? 'Record Waste' : 'Adjust Stock'}
             </h2>
             <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 20 }}>
@@ -724,8 +939,8 @@ export default function Inventory() {
           }}
           onClick={e => { if (e.target === e.currentTarget) setShowAddModal(false) }}
         >
-          <div className="card fade-in" style={{ width: '100%', maxWidth: 460, maxHeight: '90vh', overflowY: 'auto', padding: 'clamp(16px, 4vw, 28px) clamp(14px, 4vw, 26px)', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
-            <h2 style={{ fontFamily: 'Fraunces', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
+          <div className="card fade-in" style={{ width: '100%', maxWidth: 460, padding: '28px 26px', boxShadow: '0 25px 60px rgba(0,0,0,0.35)' }}>
+            <h2 style={{ fontFamily: 'Inter', fontSize: 20, fontWeight: 700, color: 'var(--foreground)', marginBottom: 6 }}>
               Add New Inventory Item
             </h2>
             <p style={{ fontSize: 13, color: 'var(--muted-foreground)', marginBottom: 18 }}>
@@ -747,22 +962,7 @@ export default function Inventory() {
                 </div>
                 <div>
                   <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--foreground)', marginBottom: 4 }}>Measurement Unit *</label>
-                  <select
-                    className="input"
-                    required
-                    value={newItemUnit}
-                    onChange={e => setNewItemUnit(e.target.value)}
-                    style={{ width: '100%', padding: '9px 12px', fontSize: 13 }}
-                  >
-                    <option value="kg">kg (kilogram)</option>
-                    <option value="lb">lb (pound)</option>
-                    <option value="g">g (gram)</option>
-                    <option value="pcs">pcs (pieces)</option>
-                    <option value="liters">liters</option>
-                    <option value="ml">ml (milliliter)</option>
-                    <option value="packs">packs</option>
-                    <option value="boxes">boxes</option>
-                  </select>
+                  <input className="input" required value={newItemUnit} onChange={e => setNewItemUnit(e.target.value)} placeholder="e.g. kg, liters, pcs" style={{ width: '100%', padding: '9px 12px', fontSize: 13 }} />
                 </div>
               </div>
 
@@ -801,163 +1001,6 @@ export default function Inventory() {
                 </button>
               </div>
             </form>
-          </div>
-        </div>,
-        document.body
-      )}
-
-      {/* In-App Inventory Movement Report Modal */}
-      {reportModalData && typeof document !== 'undefined' && createPortal(
-        <div
-          style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            width: '100vw',
-            height: '100vh',
-            background: 'rgba(0,0,0,0.65)',
-            backdropFilter: 'blur(4px)',
-            WebkitBackdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 9999,
-            padding: 20,
-          }}
-          onClick={e => { if (e.target === e.currentTarget) setReportModalData(null) }}
-        >
-          <div
-            className="card fade-in"
-            style={{
-              width: '100%',
-              maxWidth: 920,
-              maxHeight: '90vh',
-              display: 'flex',
-              flexDirection: 'column',
-              background: '#fff',
-              color: '#1c1917',
-              padding: 0,
-              overflow: 'hidden',
-              boxShadow: '0 25px 60px rgba(0,0,0,0.35)',
-              borderRadius: 14,
-            }}
-          >
-            {/* Top Bar with Back Button */}
-            <div
-              style={{
-                padding: '14px 22px',
-                borderBottom: '1px solid #e7e5e4',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                background: '#fafaf9',
-              }}
-            >
-              <button
-                id="btn-back-to-inventory"
-                type="button"
-                onClick={() => setReportModalData(null)}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: '9px 16px',
-                  fontSize: 13,
-                  fontWeight: 600,
-                  color: '#44403c',
-                  background: '#f5f5f4',
-                  border: '1px solid #d6d3d1',
-                  borderRadius: 8,
-                  cursor: 'pointer',
-                  transition: 'background 0.15s',
-                }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="19" y1="12" x2="5" y2="12"></line>
-                  <polyline points="12 19 5 12 12 5"></polyline>
-                </svg>
-                ← Back to Inventory
-              </button>
-
-              <button
-                id="btn-print-inventory-report"
-                type="button"
-                onClick={() => window.print()}
-                className="btn-primary"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  padding: '9px 18px',
-                  fontSize: 13,
-                  fontWeight: 600,
-                  borderRadius: 8,
-                  background: 'var(--primary)',
-                }}
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="6 9 6 2 18 2 18 9"></polyline>
-                  <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
-                  <rect x="6" y="14" width="12" height="8"></rect>
-                </svg>
-                Print Report
-              </button>
-            </div>
-
-            {/* Content Area */}
-            <div style={{ flex: 1, overflowY: 'auto', padding: 'clamp(14px, 3vw, 24px) clamp(14px, 4vw, 28px)' }}>
-              <div style={{ marginBottom: 18 }}>
-                <h2 style={{ fontFamily: 'Fraunces', fontSize: 22, fontWeight: 700, color: '#1c1917', marginBottom: 4 }}>
-                  WINGTRACK — Inventory Movement Report
-                </h2>
-                <p style={{ fontSize: 13, color: '#78716c' }}>
-                  Period: <strong style={{ color: '#1c1917' }}>{reportModalData.periodLabel}</strong> &nbsp;|&nbsp; Generated: {reportModalData.generatedAt} &nbsp;|&nbsp; {reportModalData.records.length} record(s)
-                </p>
-              </div>
-
-              <div style={{ overflowX: 'auto', border: '1px solid #e7e5e4', borderRadius: 8 }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-                  <thead>
-                    <tr style={{ background: '#f5f5f4', borderBottom: '2px solid #e7e5e4' }}>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Timestamp</th>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Item</th>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Type</th>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Change</th>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Before → After</th>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Staff</th>
-                      <th style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#57534e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Notes</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {reportModalData.records.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} style={{ textAlign: 'center', color: '#888', padding: '36px' }}>
-                          No records for this period.
-                        </td>
-                      </tr>
-                    ) : (
-                      reportModalData.records.map((m, idx) => (
-                        <tr key={m.id || idx} style={{ borderBottom: '1px solid #f5f5f4' }}>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>
-                            {new Date(m.created_at).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}
-                          </td>
-                          <td style={{ padding: '10px 12px', fontWeight: 600 }}>{m.inventory?.name ?? 'Unknown'}</td>
-                          <td style={{ padding: '10px 12px', textTransform: 'capitalize' }}>{m.movement_type}</td>
-                          <td style={{ padding: '10px 12px', fontWeight: 600, color: m.qty_change > 0 ? '#15803d' : '#b91c1c' }}>
-                            {m.qty_change > 0 ? `+${m.qty_change}` : m.qty_change} {m.inventory?.unit ?? ''}
-                          </td>
-                          <td style={{ padding: '10px 12px' }}>
-                            {Number(m.qty_before).toFixed(2)} → {Number(m.qty_after).toFixed(2)}
-                          </td>
-                          <td style={{ padding: '10px 12px' }}>{m.staff?.full_name ?? 'System'}</td>
-                          <td style={{ padding: '10px 12px', color: '#78716c' }}>{m.notes || '-'}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
           </div>
         </div>,
         document.body

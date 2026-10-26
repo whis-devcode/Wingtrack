@@ -3,6 +3,13 @@
 -- PostgreSQL DDL — Run in Supabase SQL Editor
 -- (Idempotent & Rerunnable Migration)
 -- ============================================================
+--
+-- This file is the canonical definition for a BRAND-NEW database.
+--
+-- To bring an EXISTING database up to date, run
+-- `supabase/RUN_ALL_MIGRATIONS.sql` instead — it is the concatenation of
+-- everything under supabase/migrations/ and is what the application expects
+-- to have been applied.
 
 -- Enable UUID extension (already available in Supabase)
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -45,9 +52,22 @@ CREATE TABLE IF NOT EXISTS public.staff_profiles (
     role           public.staff_role NOT NULL DEFAULT 'cashier',
     is_active      BOOLEAN NOT NULL DEFAULT TRUE,
     created_by     UUID REFERENCES public.staff_profiles(id),
+    -- Public URL of the member's photo in the `avatars` Storage bucket.
+    avatar_url      TEXT,
+    -- Stamped by the client heartbeat (~45s) while the app is open; drives
+    -- the "online now" indicator on the Staff Manager screen.
+    last_seen_at    TIMESTAMPTZ,
+    -- Stamped once per browser session; shown in the staff detail panel.
+    last_sign_in_at TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Existing installs: bring a pre-presence table up to date (idempotent).
+ALTER TABLE public.staff_profiles
+    ADD COLUMN IF NOT EXISTS avatar_url      TEXT,
+    ADD COLUMN IF NOT EXISTS last_seen_at    TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_sign_in_at TIMESTAMPTZ;
 
 -- PRODUCT CATEGORIES
 CREATE TABLE IF NOT EXISTS public.product_categories (
@@ -459,40 +479,60 @@ CREATE INDEX IF NOT EXISTS idx_order_items_order ON public.order_items (order_id
 CREATE INDEX IF NOT EXISTS idx_inv_mov_inventory ON public.inventory_movements (inventory_id);
 CREATE INDEX IF NOT EXISTS idx_inv_mov_order     ON public.inventory_movements (order_id);
 CREATE INDEX IF NOT EXISTS idx_staff_user_id     ON public.staff_profiles (user_id);
+CREATE INDEX IF NOT EXISTS idx_staff_last_seen   ON public.staff_profiles (last_seen_at DESC);
 
 -- ============================================================
--- 8. CASHIER SHIFTS (Float & Z-Reading Tracking)
+-- 7b. REALTIME (Idempotent)
 -- ============================================================
+--
+-- The Staff Manager subscribes to postgres_changes on staff_profiles so a
+-- rename, role change or deactivation lands in every open admin session
+-- without a manual refresh. RLS still applies to Realtime, so only admins
+-- (via `admin_all_staff`) receive rows from this table.
 
-CREATE TABLE IF NOT EXISTS public.cashier_shifts (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    cashier_id      UUID NOT NULL REFERENCES public.staff_profiles(id),
-    opening_float   NUMERIC(10, 2) NOT NULL DEFAULT 0,
-    closing_cash    NUMERIC(10, 2),
-    expected_cash   NUMERIC(10, 2),
-    cash_difference NUMERIC(10, 2),
-    total_sales     NUMERIC(10, 2) DEFAULT 0,
-    cash_sales      NUMERIC(10, 2) DEFAULT 0,
-    orders_count    INT DEFAULT 0,
-    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
-    notes           TEXT,
-    opened_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    closed_at       TIMESTAMPTZ
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_publication_tables
+        WHERE pubname    = 'supabase_realtime'
+          AND schemaname = 'public'
+          AND tablename  = 'staff_profiles'
+    ) THEN
+        ALTER PUBLICATION supabase_realtime ADD TABLE public.staff_profiles;
+    END IF;
+END $$;
+
+-- ============================================================
+-- 8. LOGIN ONE-TIME CODES (Idempotent)
+-- ============================================================
+--
+-- Stores short-lived sign-in codes for staff who use the "OTP" login tab.
+--
+-- WHY THIS EXISTS
+-- ---------------
+-- Supabase's built-in mailer refuses to deliver to anyone outside the project's
+-- own team and is capped at ~2 messages/hour, so emailed login codes silently
+-- never arrive. When custom SMTP is configured the server generates the code
+-- here and mails it directly, removing both restrictions.
+--
+-- Codes are stored only as a SHA-256 hash: a leaked database dump cannot be
+-- used to sign in. Consumption is single-use and sets consumed_at.
+
+CREATE TABLE IF NOT EXISTS public.login_otps (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    email       text NOT NULL,
+    code_hash   text NOT NULL,
+    expires_at  timestamptz NOT NULL,
+    consumed_at timestamptz,
+    attempts    integer NOT NULL DEFAULT 0,
+    created_at  timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE public.cashier_shifts ENABLE ROW LEVEL SECURITY;
+-- Lookup path: newest live code for an email.
+CREATE INDEX IF NOT EXISTS idx_login_otps_email_created
+    ON public.login_otps (email, created_at DESC);
 
-DROP POLICY IF EXISTS "shifts_all_admin" ON public.cashier_shifts;
-CREATE POLICY "shifts_all_admin" ON public.cashier_shifts
-    FOR ALL USING (public.get_current_user_role() = 'admin');
-
-DROP POLICY IF EXISTS "shifts_cashier" ON public.cashier_shifts;
-CREATE POLICY "shifts_cashier" ON public.cashier_shifts
-    FOR ALL USING (
-        public.get_current_user_role() = 'admin'
-        OR cashier_id = (SELECT id FROM public.staff_profiles WHERE user_id = (SELECT auth.uid()))
-    );
-
-CREATE INDEX IF NOT EXISTS idx_shifts_cashier ON public.cashier_shifts (cashier_id);
-CREATE INDEX IF NOT EXISTS idx_shifts_status  ON public.cashier_shifts (status);
-
+-- No RLS policies are defined: this table is only ever touched by the server
+-- using the service-role key. RLS is enabled so the anon/authenticated roles
+-- can never read codes even if a policy is added later by mistake.
+ALTER TABLE public.login_otps ENABLE ROW LEVEL SECURITY;

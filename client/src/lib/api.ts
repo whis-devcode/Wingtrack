@@ -1,5 +1,13 @@
 import { supabase } from './supabase'
-import type { CheckoutPayload, InventoryAdjustmentPayload } from '@/types'
+import type {
+  CheckoutPayload,
+  InventoryAdjustmentPayload,
+  Order,
+  OrderSummary,
+  Product,
+  StaffProfile,
+  StaffUpdatePayload,
+} from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api'
 
@@ -114,6 +122,154 @@ export async function apiReactivateStaff(staffId: string) {
 }
 
 /**
+ * GET /api/staff (Admin only)
+ *
+ * The Staff Manager loads through the API rather than reading `staff_profiles`
+ * directly. The server merges in `auth.users.last_sign_in_at` and the avatar
+ * URL from auth metadata — neither is reachable from the browser, and both are
+ * what keep the ACTIVITY column meaningful before the presence migration has
+ * been applied.
+ */
+export async function apiGetStaff(): Promise<StaffProfile[]> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff`, { method: 'GET', headers })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to load staff')
+  }
+  return res.json()
+}
+
+/**
+ * PATCH /api/staff/:id (Admin only)
+ *
+ * Edits a staff member's name, sign-in email, role or access. The server
+ * rejects changes that would leave the shop without an active administrator,
+ * and mirrors an email change onto the underlying auth account.
+ */
+export async function apiUpdateStaff(staffId: string, payload: StaffUpdatePayload) {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/${staffId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to update staff member')
+  }
+  return res.json() as Promise<StaffProfile>
+}
+
+/**
+ * PATCH /api/staff/me (Authenticated)
+ * Updates the caller's own display name.
+ */
+export async function apiUpdateMyProfile(payload: { full_name: string }) {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/me`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to update your profile')
+  }
+  return res.json() as Promise<StaffProfile>
+}
+
+/**
+ * POST /api/staff/heartbeat (Authenticated)
+ *
+ * Stamps `last_seen_at` so the Staff Manager can show who is online. The
+ * response echoes the caller's live role and access flag, which is how an
+ * admin's change reaches an already-open session without a page reload.
+ *
+ * Pass `sign_in: true` once per browser session to also stamp
+ * `last_sign_in_at`.
+ */
+export async function apiSendHeartbeat(options?: { signIn?: boolean }): Promise<{
+  last_seen_at: string | null
+  /** False when the presence migration has not been applied yet. */
+  presence_available?: boolean
+  profile: Pick<StaffProfile, 'id' | 'role' | 'is_active' | 'full_name'>
+}> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/heartbeat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ sign_in: options?.signIn === true }),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Presence update failed')
+  }
+  return res.json()
+}
+
+/**
+ * POST /api/staff/me/avatar (Authenticated)
+ *
+ * Uploads the raw image bytes rather than multipart form data — a single
+ * file field does not justify a multipart parser. The server stores the file
+ * with the service-role key, so no Storage RLS policy is involved.
+ */
+export async function apiUploadAvatar(file: File): Promise<StaffProfile> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/me/avatar`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': file.type },
+    body: file,
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to upload your photo')
+  }
+  return res.json()
+}
+
+/** DELETE /api/staff/me/avatar (Authenticated) — removes the caller's photo. */
+export async function apiRemoveAvatar(): Promise<StaffProfile> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/me/avatar`, {
+    method: 'DELETE',
+    headers,
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to remove your photo')
+  }
+  return res.json()
+}
+
+/**
+ * POST /api/staff/:id/avatar (Admin only)
+ *
+ * Sets another member's photo. Most staff never open Settings, so this is how
+ * an administrator supplies the picture the Staff Manager displays.
+ */
+export async function apiUploadStaffAvatar(staffId: string, file: File): Promise<StaffProfile> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/${staffId}/avatar`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': file.type },
+    body: file,
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to upload that photo')
+  }
+  return res.json()
+}
+
+/** DELETE /api/staff/:id/avatar (Admin only) — clears another member's photo. */
+export async function apiRemoveStaffAvatar(staffId: string): Promise<StaffProfile> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/staff/${staffId}/avatar`, {
+    method: 'DELETE',
+    headers,
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to remove that photo')
+  }
+  return res.json()
+}
+
+/**
  * PATCH /api/staff/update-password (Authenticated users)
  */
 export async function apiUpdatePassword(password: string) {
@@ -131,19 +287,72 @@ export async function apiUpdatePassword(password: string) {
 }
 
 /**
- * GET /api/orders (Cashier or Admin)
+ * Parse a failed response into a human-readable Error. Surfaces the HTTP
+ * status so a proxy/network failure ("Failed to fetch") is distinguishable
+ * from a real API error message.
  */
-export async function apiGetOrders() {
+async function toApiError(res: Response, fallback: string): Promise<Error> {
+  const body = await res.json().catch(() => null) as { message?: string } | null
+  if (body?.message) return new Error(body.message)
+  if (res.status === 401) return new Error('Your session has expired. Please sign in again.')
+  if (res.status === 403) return new Error('You do not have permission to perform this action.')
+  return new Error(`${fallback} (HTTP ${res.status})`)
+}
+
+/**
+ * GET /api/orders (Cashier or Admin)
+ *
+ * Returns a page of orders plus the total row count, so the UI can show
+ * "showing X of Y" and offer pagination instead of silently truncating.
+ *
+ * A cashier's request is scoped to their own orders server-side; `summary`
+ * carries the matching running totals (see OrderSummary).
+ */
+export async function apiGetOrders(params?: {
+  limit?: number
+  offset?: number
+  status?: 'completed' | 'void'
+  from?: string
+  to?: string
+  search?: string
+}): Promise<{
+  orders: Order[]
+  total: number
+  limit: number
+  offset: number
+  /** Absent when the server could not compute it — the UI hides the strip. */
+  summary?: OrderSummary | null
+}> {
   const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/orders`, {
+  const qs = new URLSearchParams()
+  if (params?.limit != null) qs.set('limit', String(params.limit))
+  if (params?.offset != null) qs.set('offset', String(params.offset))
+  if (params?.status) qs.set('status', params.status)
+  if (params?.from) qs.set('from', params.from)
+  if (params?.to) qs.set('to', params.to)
+  if (params?.search) qs.set('search', params.search)
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+
+  const res = await fetch(`${API_BASE}/orders${suffix}`, {
     method: 'GET',
     headers,
   })
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Failed to fetch orders' }))
-    throw new Error(err.message ?? 'Failed to fetch orders')
+    throw await toApiError(res, 'Failed to fetch orders')
   }
-  return res.json()
+
+  const json = await res.json()
+  // Tolerate the legacy bare-array shape so an older server does not break the UI.
+  if (Array.isArray(json)) {
+    return { orders: json as Order[], total: json.length, limit: json.length, offset: 0, summary: null }
+  }
+  return {
+    orders: (json.orders ?? []) as Order[],
+    total: json.total ?? 0,
+    limit: json.limit ?? 100,
+    offset: json.offset ?? 0,
+    summary: (json.summary ?? null) as OrderSummary | null,
+  }
 }
 
 /**
@@ -173,8 +382,7 @@ export async function apiGetInventoryMovements() {
     headers,
   })
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Failed to fetch inventory movements' }))
-    throw new Error(err.message ?? 'Failed to fetch inventory movements')
+    throw await toApiError(res, 'Failed to fetch inventory movements')
   }
   return res.json()
 }
@@ -214,8 +422,7 @@ export async function apiGetProducts() {
     headers,
   })
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Failed to fetch products' }))
-    throw new Error(err.message ?? 'Failed to fetch products')
+    throw await toApiError(res, 'Failed to fetch products')
   }
   return res.json()
 }
@@ -230,8 +437,7 @@ export async function apiGetCategories() {
     headers,
   })
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Failed to fetch categories' }))
-    throw new Error(err.message ?? 'Failed to fetch categories')
+    throw await toApiError(res, 'Failed to fetch categories')
   }
   return res.json()
 }
@@ -260,8 +466,10 @@ export async function apiCreateProduct(payload: {
   name: string
   category_id: string
   price: number
+  unit_cost?: number
   is_available?: boolean
   image_url?: string
+  product_type?: string
   recipes?: Array<{ inventory_id: string; qty_per_unit: number }>
 }) {
   const headers = await getAuthHeader()
@@ -284,8 +492,10 @@ export async function apiUpdateProduct(id: string, payload: {
   name?: string
   category_id?: string
   price?: number
+  unit_cost?: number
   is_available?: boolean
   image_url?: string
+  product_type?: string
   recipes?: Array<{ inventory_id: string; qty_per_unit: number }>
 }) {
   const headers = await getAuthHeader()
@@ -319,6 +529,40 @@ export async function apiToggleProductAvailability(id: string, is_available: boo
 }
 
 /**
+ * POST /api/products/:id/image (Admin only)
+ *
+ * Uploads a dish photo and returns the updated product. The raw image bytes
+ * are the body rather than multipart form data — a single file field does not
+ * justify a multipart parser. The server stores the file with the service-role
+ * key, so no Storage RLS policy is involved.
+ */
+export async function apiUploadProductImage(productId: string, file: File): Promise<Product> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/products/${productId}/image`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': file.type },
+    body: file,
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to upload the photo')
+  }
+  return res.json() as Promise<Product>
+}
+
+/** DELETE /api/products/:id/image (Admin only) — clears a dish photo. */
+export async function apiRemoveProductImage(productId: string): Promise<Product> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/products/${productId}/image`, {
+    method: 'DELETE',
+    headers,
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to remove the photo')
+  }
+  return res.json() as Promise<Product>
+}
+
+/**
  * DELETE /api/products/:id (Admin only)
  */
 export async function apiDeleteProduct(id: string) {
@@ -335,18 +579,20 @@ export async function apiDeleteProduct(id: string) {
 }
 
 /**
- * POST /api/auth/signup
- * Registers a new staff account and provisions their profile.
+ * POST /api/auth/signup  (Admin only)
+ * Provisions a new staff account. Requires an authenticated admin session —
+ * public self-registration is disabled.
  */
 export async function apiSignUp(payload: {
   email: string
   password: string
   full_name: string
-  role?: string
+  role: 'admin' | 'cashier' | 'inventory_personnel'
 }) {
+  const headers = await getAuthHeader()
   const res = await fetch(`${API_BASE}/auth/signup`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(payload),
   })
   if (!res.ok) {
@@ -357,6 +603,186 @@ export async function apiSignUp(payload: {
 }
 
 
+
+/**
+ * POST /api/auth/check-registered  (Public)
+ * Reports whether an email belongs to a provisioned staff account.
+ * Deliberately unauthenticated: it runs before login, and it returns only a
+ * boolean pair — never a name, role, or id.
+ */
+export async function apiCheckRegistered(email: string): Promise<{
+  registered: boolean
+  active: boolean
+  message?: string
+}> {
+  const res = await fetch(`${API_BASE}/auth/check-registered`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: 'Unable to verify this email right now.' }))
+    throw new Error(err.message ?? 'Unable to verify this email right now.')
+  }
+  return res.json()
+}
+
+/**
+ * POST /api/auth/send-login-otp  (Public, staff-gated)
+ *
+ * Asks the server to email a sign-in code. The server only mails when a custom
+ * SMTP relay is configured; otherwise it replies `{ sent: false, reason: 'smtp' }`
+ * so the caller can fall back to Supabase's mailer. A `registered: false`
+ * outcome surfaces as an Error carrying the server's guidance message.
+ */
+export async function apiSendLoginOtp(email: string): Promise<{
+  sent: boolean
+  reason?: 'smtp' | 'schema'
+  message?: string
+}> {
+  const res = await fetch(`${API_BASE}/auth/send-login-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+  const body = await res.json().catch(() => null) as
+    | { sent?: boolean; reason?: 'smtp' | 'schema'; message?: string }
+    | null
+
+  if (!res.ok) {
+    throw new Error(body?.message ?? 'Unable to send a code right now. Please try again.')
+  }
+  return { sent: Boolean(body?.sent), reason: body?.reason, message: body?.message }
+}
+
+/** Why a password-reset request did not result in a delivered email. */
+export type PasswordResetReason = 'smtp' | 'refused' | 'delivery'
+
+/**
+ * POST /api/auth/send-password-reset  (Public, staff-gated)
+ *
+ * Asks the server to email a password-reset link. The server only mails when a
+ * custom SMTP relay is configured; otherwise it replies
+ * `{ sent: false, reason: 'smtp' }` so the caller can fall back to Supabase's
+ * mailer — whose own delivery is restricted and unverifiable.
+ *
+ * Deliberately does NOT throw on a non-2xx response: every outcome here is a
+ * decision the caller has to make (fall back, or show the user why not), so the
+ * result is returned rather than raised. Only a transport failure throws.
+ */
+export async function apiSendPasswordReset(
+  email: string,
+  redirectTo: string,
+): Promise<{ sent: boolean; reason?: PasswordResetReason; message?: string }> {
+  const res = await fetch(`${API_BASE}/auth/send-password-reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, redirectTo }),
+  })
+
+  const body = await res.json().catch(() => null) as
+    | { sent?: boolean; reason?: PasswordResetReason; message?: string }
+    | null
+
+  return { sent: Boolean(body?.sent), reason: body?.reason, message: body?.message }
+}
+
+/**
+ * POST /api/auth/provision-self  (Authenticated)
+ * Completes self-service sign-up by creating the caller's staff_profiles row.
+ * Idempotent: safe to call on every sign-in. The server clamps the role to
+ * non-admin values and never reactivates a deactivated account.
+ */
+export async function apiProvisionSelf(payload?: { full_name?: string; role?: string }) {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/auth/provision-self`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(payload ?? {}),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to complete registration')
+  }
+  return res.json() as Promise<{
+    provisioned: boolean
+    created: boolean
+    role?: string
+    is_active?: boolean
+  }>
+}
+
+/**
+ * POST /api/auth/register-otp (Public)
+ * Initiates staff registration, generating a 6-digit confirmation OTP.
+ */
+export async function apiRegisterWithOtp(data: {
+  email: string
+  password: string
+  full_name: string
+  role?: string
+}) {
+  const res = await fetch(`${API_BASE}/auth/register-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Registration failed')
+  }
+  return res.json() as Promise<{
+    success: boolean
+    email: string
+    delivered: boolean
+    devOtp?: string
+    message: string
+  }>
+}
+
+/**
+ * POST /api/auth/resend-registration-otp (Public)
+ */
+export async function apiResendRegistrationOtp(email: string) {
+  const res = await fetch(`${API_BASE}/auth/resend-registration-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to resend verification code')
+  }
+  return res.json() as Promise<{
+    success: boolean
+    email: string
+    delivered: boolean
+    devOtp?: string
+    message: string
+  }>
+}
+
+/**
+ * POST /api/auth/verify-registration-otp (Public)
+ * Validates registration OTP and provisions the staff account.
+ */
+export async function apiVerifyRegistrationOtp(data: {
+  email: string
+  token: string
+  full_name?: string
+  role?: string
+}) {
+  const res = await fetch(`${API_BASE}/auth/verify-registration-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Verification failed')
+  }
+  return res.json() as Promise<{
+    success: boolean
+    verified: boolean
+    message: string
+  }>
+}
 
 
 // --- PayMongo Sandbox Helpers --------------------------------
@@ -430,34 +856,3 @@ export async function apiCreateCheckoutSession(payload: {
   }>
 }
 
-// --- Cashier Shifts --------------------------------
-
-/** POST /api/shifts/open */
-export async function apiOpenShift(payload: { opening_float: number; notes?: string }) {
-  const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/shifts/open`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify(payload),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Failed to open shift' }))
-    throw new Error(err.message ?? 'Failed to open shift')
-  }
-  return res.json()
-}
-
-/** POST /api/shifts/close */
-export async function apiCloseShift(payload: { closing_cash: number; notes?: string }) {
-  const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/shifts/close`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify(payload),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Failed to close shift' }))
-    throw new Error(err.message ?? 'Failed to close shift')
-  }
-  return res.json()
-}
