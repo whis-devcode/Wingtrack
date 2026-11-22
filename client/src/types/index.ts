@@ -72,7 +72,20 @@ export interface InventoryItem {
   supplier?: string
   status: 'ok' | 'low' | 'critical'
   updated_at: string
+  /** Optional batch expiration / best-before date (YYYY-MM-DD). */
+  expiration_date?: string | null
+  /** Supplier lead time in days used for Reorder Point (ROP) calculation. */
+  lead_time_days?: number
+  /** Average daily usage (units/day) computed from 30-day consumption. */
+  avg_daily_usage?: number
+  /** Calculated Reorder Point: (Avg Daily Usage × Lead Time) + Safety Stock. */
+  reorder_point?: number
+  /** Suggested restock quantity when stock is at or below ROP / min level. */
+  suggested_reorder_qty?: number
 }
+
+export type OrderType = 'dine_in' | 'take_out' | 'delivery'
+export type DiscountType = 'none' | 'senior' | 'pwd'
 
 export interface Order {
   id: string
@@ -80,13 +93,27 @@ export interface Order {
   cashier_id: string
   cashier?: StaffProfile
   status: 'open' | 'completed' | 'void'
-  payment_method: 'cash' | 'gcash' | 'card'
+  payment_method: 'cash' | 'gcash' | 'maya' | 'card'
   subtotal: number
   vat_amount: number
   total_amount: number
   notes?: string
   created_at: string
   order_items?: OrderItem[]
+  /** Fulfillment mode: Dine-In, Take-Out, or Delivery. */
+  order_type?: OrderType
+  /** Optional table number when order_type is dine_in (e.g. "Table 4"). */
+  table_number?: string | null
+  /** Optional Philippine statutory discount (Senior Citizen / PWD 20% + VAT-exempt). */
+  discount_type?: DiscountType
+  /** Optional Senior Citizen / PWD ID number for BIR receipt compliance. */
+  discount_id?: string | null
+  /** Computed discount amount in PHP. */
+  discount_amount?: number
+  /** Optional GCash / Maya / Card reference or approval number. */
+  payment_reference?: string | null
+  /** "inserted" when the order was manually transferred from a previous system. */
+  note?: string
 }
 
 export interface OrderItem {
@@ -121,7 +148,34 @@ export interface CartItem extends Product {
 // API payload shapes
 export interface CheckoutPayload {
   items: { product_id: string; quantity: number }[]
-  payment_method: 'cash' | 'gcash' | 'card'
+  payment_method: 'cash' | 'gcash' | 'maya' | 'card'
+  notes?: string
+  order_type?: OrderType
+  table_number?: string | null
+  discount_type?: DiscountType
+  discount_id?: string | null
+  payment_reference?: string | null
+}
+
+/** A single item line when transferring an old sale from the previous system. */
+export interface ImportOrderItemPayload {
+  name: string
+  quantity: number
+  unit_price: number
+  unit_cost?: number
+  product_id?: string | null
+}
+
+/** Payload for POST /api/orders/import — manually recording a previous-system sale. */
+export interface ImportOrderPayload {
+  created_at: string
+  items: ImportOrderItemPayload[]
+  payment_method: 'cash' | 'gcash' | 'maya' | 'card'
+  order_type?: OrderType
+  table_number?: string | null
+  discount_type?: DiscountType
+  discount_id?: string | null
+  payment_reference?: string | null
   notes?: string
 }
 
@@ -130,6 +184,8 @@ export interface InventoryAdjustmentPayload {
   qty_change: number
   movement_type: 'restock' | 'adjustment' | 'waste'
   notes?: string
+  expiration_date?: string | null
+  lead_time_days?: number
 }
 
 export interface InventoryMovement {
@@ -155,5 +211,43 @@ export interface CreateInventoryItemPayload {
   min_stock_level?: number
   unit_cost?: number
   supplier?: string
+  expiration_date?: string | null
+  lead_time_days?: number
 }
+
+export interface CashierShift {
+  id: string
+  cashier_id: string
+  opening_float: number
+  closing_cash?: number | null
+  expected_cash?: number | null
+  cash_difference?: number | null
+  total_sales?: number
+  cash_sales?: number
+  gcash_sales?: number
+  card_sales?: number
+  orders_count?: number
+  status: 'open' | 'closed'
+  notes?: string | null
+  opened_at: string
+  closed_at?: string | null
+  cashier?: { full_name: string; email?: string }
+}
+
+export interface ShiftSummaryData {
+  cashier_name: string
+  opening_float: number
+  closing_cash: number
+  expected_cash: number
+  cash_difference: number
+  cash_sales: number
+  gcash_sales: number
+  card_sales: number
+  total_sales: number
+  orders_count: number
+  opened_at: string
+  closed_at: string
+  notes?: string | null
+}
+
 

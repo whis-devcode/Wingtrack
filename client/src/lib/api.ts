@@ -2,10 +2,13 @@ import { supabase } from './supabase'
 import type {
   CheckoutPayload,
   InventoryAdjustmentPayload,
+  InventoryItem,
+  InventoryMovement,
   Order,
   OrderSummary,
   Product,
   StaffProfile,
+  StaffRole,
   StaffUpdatePayload,
 } from '@/types'
 
@@ -13,21 +16,72 @@ const API_BASE = import.meta.env.VITE_API_URL ?? '/api'
 
 /**
  * Get the current Supabase access token for Express API auth.
+ * Refreshes automatically when expiring soon (or when `forceRefresh` is true).
  */
-async function getAuthHeader(): Promise<Record<string, string>> {
+async function getAuthHeader(forceRefresh = false): Promise<Record<string, string>> {
   const { data: { session } } = await supabase.auth.getSession()
   let token = session?.access_token
+  const expiresAtMs = session?.expires_at ? session.expires_at * 1000 : 0
+  const isExpired = expiresAtMs > 0 && expiresAtMs <= Date.now()
+  const needsRefresh = forceRefresh || (expiresAtMs > 0 && expiresAtMs < Date.now() + 60000)
 
-  // If session is expired or expires within 60s, refresh it
-  if (session?.expires_at && session.expires_at * 1000 < Date.now() + 60000) {
-    const { data: refreshData } = await supabase.auth.refreshSession()
+  if (needsRefresh) {
+    const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession()
     if (refreshData?.session?.access_token) {
       token = refreshData.session.access_token
+    } else if (refreshErr && (isExpired || forceRefresh)) {
+      await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined)
+      throw new Error('Your session has expired. Please sign in again.')
     }
   }
 
   if (!token) throw new Error('Not authenticated')
   return { Authorization: `Bearer ${token}` }
+}
+
+/**
+ * Authenticated fetch that retries once with a forced session refresh if the
+ * API rejects the token with 401 (e.g. stale/revoked JWT after a password or
+ * email change). If the refreshed token is still rejected, clears the dead
+ * local session so the UI returns cleanly to Sign In.
+ */
+async function fetchAuthed(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = await getAuthHeader(false)
+  let res = await fetch(url, { ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...headers } })
+  if (res.status === 401) {
+    try {
+      const freshHeaders = await getAuthHeader(true)
+      res = await fetch(url, { ...init, headers: { ...(init.headers as Record<string, string> | undefined), ...freshHeaders } })
+      if (res.status === 401) {
+        await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined)
+      }
+    } catch {
+      // getAuthHeader already cleared the dead session; return the original 401
+    }
+  }
+  return res
+}
+
+/**
+ * Wrapper around fetch that automatically retries once on transient gateway
+ * errors (502/503/504) or network hiccups when the API server is restarting.
+ */
+async function fetchWithRetry(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    const res = await fetch(url, init)
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      await new Promise(r => setTimeout(r, 700))
+      return await fetch(url, init)
+    }
+    return res
+  } catch {
+    await new Promise(r => setTimeout(r, 700))
+    return await fetch(url, init)
+  }
+}
+
+function isGatewayDown(res: Response): boolean {
+  return res.status === 502 || res.status === 503 || res.status === 504
 }
 
 /**
@@ -131,8 +185,7 @@ export async function apiReactivateStaff(staffId: string) {
  * been applied.
  */
 export async function apiGetStaff(): Promise<StaffProfile[]> {
-  const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/staff`, { method: 'GET', headers })
+  const res = await fetchAuthed(`${API_BASE}/staff`, { method: 'GET' })
   if (!res.ok) {
     throw await toApiError(res, 'Failed to load staff')
   }
@@ -147,10 +200,9 @@ export async function apiGetStaff(): Promise<StaffProfile[]> {
  * and mirrors an email change onto the underlying auth account.
  */
 export async function apiUpdateStaff(staffId: string, payload: StaffUpdatePayload) {
-  const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/staff/${staffId}`, {
+  const res = await fetchAuthed(`${API_BASE}/staff/${staffId}`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
   if (!res.ok) {
@@ -161,13 +213,18 @@ export async function apiUpdateStaff(staffId: string, payload: StaffUpdatePayloa
 
 /**
  * PATCH /api/staff/me (Authenticated)
- * Updates the caller's own display name.
+ * Updates the caller's own display name; admins may also update their own email and role.
  */
-export async function apiUpdateMyProfile(payload: { full_name: string }) {
-  const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/staff/me`, {
+export async function apiUpdateMyProfile(payload: {
+  full_name: string
+  email?: string
+  role?: StaffRole
+  /** 6-digit code emailed to the new address; required when email changes. */
+  email_code?: string
+}) {
+  const res = await fetchAuthed(`${API_BASE}/staff/me`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
   if (!res.ok) {
@@ -269,15 +326,57 @@ export async function apiRemoveStaffAvatar(staffId: string): Promise<StaffProfil
   return res.json()
 }
 
+/** Response from the step-up verification code endpoints. */
+export interface VerificationCodeResponse {
+  sent: boolean
+  /** False only in development when SMTP is not configured. */
+  delivered: boolean
+  email: string
+  /** Present only in development without SMTP — never in production. */
+  dev_code?: string
+}
+
+/**
+ * POST /api/staff/me/email-change/code (Admin only)
+ * Emails a 6-digit code to the NEW address before the sign-in email changes.
+ */
+export async function apiRequestEmailChangeCode(email: string): Promise<VerificationCodeResponse> {
+  const res = await fetchAuthed(`${API_BASE}/staff/me/email-change/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+  if (!res.ok) throw await toApiError(res, 'Could not send the verification code')
+  return res.json()
+}
+
+/**
+ * POST /api/staff/me/password-change/code (Authenticated)
+ * Confirms the current password, then emails a 6-digit code to the current address.
+ */
+export async function apiRequestPasswordChangeCode(currentPassword: string): Promise<VerificationCodeResponse> {
+  const res = await fetchAuthed(`${API_BASE}/staff/me/password-change/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_password: currentPassword }),
+  })
+  if (!res.ok) throw await toApiError(res, 'Could not send the verification code')
+  return res.json()
+}
+
 /**
  * PATCH /api/staff/update-password (Authenticated users)
+ * Requires the current password and the emailed 6-digit verification code.
  */
-export async function apiUpdatePassword(password: string) {
-  const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/staff/update-password`, {
+export async function apiUpdatePassword(payload: {
+  password: string
+  current_password: string
+  code: string
+}) {
+  const res = await fetchAuthed(`${API_BASE}/staff/update-password`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify({ password }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: 'Failed to update password' }))
@@ -333,10 +432,30 @@ export async function apiGetOrders(params?: {
   if (params?.search) qs.set('search', params.search)
   const suffix = qs.toString() ? `?${qs.toString()}` : ''
 
-  const res = await fetch(`${API_BASE}/orders${suffix}`, {
+  const res = await fetchWithRetry(`${API_BASE}/orders${suffix}`, {
     method: 'GET',
     headers,
   })
+  if (isGatewayDown(res)) {
+    const limit = params?.limit ?? 100
+    const offset = params?.offset ?? 0
+    let query = supabase
+      .from('orders')
+      .select('*, order_items(*), cashier:cashier_id(full_name, email)', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+    if (params?.status) query = query.eq('status', params.status)
+    const { data, count, error } = await query
+    if (!error && data) {
+      return {
+        orders: data as Order[],
+        total: count ?? data.length,
+        limit,
+        offset,
+        summary: null,
+      }
+    }
+  }
   if (!res.ok) {
     throw await toApiError(res, 'Failed to fetch orders')
   }
@@ -356,6 +475,28 @@ export async function apiGetOrders(params?: {
 }
 
 /**
+ * POST /api/orders/import (Admin only)
+ *
+ * Records a sale from the previous system. No inventory is touched — this
+ * rebuilds history only. Imported orders come back tagged `note: 'inserted'`.
+ */
+export async function apiImportPreviousOrder(payload: import('@/types').ImportOrderPayload): Promise<{
+  id: string
+  order_number: number
+  total_amount: number
+  note: string
+}> {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/orders/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) throw await toApiError(res, 'Failed to import the previous order.')
+  return res.json()
+}
+
+/**
  * POST /api/orders/:id/void (Cashier or Admin)
  */
 export async function apiVoidOrder(orderId: string, reason?: string) {
@@ -372,19 +513,95 @@ export async function apiVoidOrder(orderId: string, reason?: string) {
   return res.json()
 }
 
+/** A paged slice of the inventory audit trail. */
+export interface InventoryMovementsPage {
+  movements: InventoryMovement[]
+  /** Total rows matching the filter — for "showing X of Y". */
+  total: number
+  limit: number
+  offset: number
+}
+
 /**
  * GET /api/inventory/movements (Admin or Inventory Personnel)
+ *
+ * Paged: every ingredient deduction writes a row here, so the trail grows with
+ * sales volume. Requesting page N is a `range()` on the server, not a fresh
+ * 100-row read with the rest truncated.
+ *
+ * Tolerates a bare-array response from an older server so a stale deployment
+ * degrades to "one page, no total" rather than breaking the tab.
  */
-export async function apiGetInventoryMovements() {
+export async function apiGetInventoryMovements(params?: {
+  limit?: number
+  offset?: number
+  inventory_id?: string
+}): Promise<InventoryMovementsPage> {
   const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/inventory/movements`, {
+  const qs = new URLSearchParams()
+  if (params?.limit != null) qs.set('limit', String(params.limit))
+  if (params?.offset != null) qs.set('offset', String(params.offset))
+  if (params?.inventory_id) qs.set('inventory_id', params.inventory_id)
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+
+  const res = await fetchWithRetry(`${API_BASE}/inventory/movements${suffix}`, {
     method: 'GET',
     headers,
   })
+  if (isGatewayDown(res)) {
+    const limit = params?.limit ?? 100
+    const offset = params?.offset ?? 0
+    let query = supabase
+      .from('inventory_movements')
+      .select('*, inventory:inventory_id(name, unit), staff:performed_by(full_name)', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(offset, offset + limit - 1)
+    if (params?.inventory_id) query = query.eq('inventory_id', params.inventory_id)
+    const { data, count, error } = await query
+    if (!error && data) {
+      return {
+        movements: data as InventoryMovement[],
+        total: count ?? data.length,
+        limit,
+        offset,
+      }
+    }
+  }
   if (!res.ok) {
     throw await toApiError(res, 'Failed to fetch inventory movements')
   }
-  return res.json()
+
+  const json = await res.json()
+  if (Array.isArray(json)) {
+    return { movements: json as InventoryMovement[], total: json.length, limit: json.length, offset: 0 }
+  }
+  return {
+    movements: (json.movements ?? []) as InventoryMovement[],
+    total: json.total ?? 0,
+    limit: json.limit ?? 100,
+    offset: json.offset ?? 0,
+  }
+}
+
+/**
+ * GET /api/inventory (Admin or Inventory Personnel)
+ * Returns inventory items enriched with ROP, suggested reorder quantity, and batch expiration date.
+ */
+export async function apiGetInventory(): Promise<InventoryItem[]> {
+  const headers = await getAuthHeader()
+  const res = await fetchWithRetry(`${API_BASE}/inventory`, {
+    method: 'GET',
+    headers,
+  })
+  if (isGatewayDown(res)) {
+    const { data, error } = await supabase.from('inventory').select('*').order('name')
+    if (!error && data) return data as InventoryItem[]
+  }
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to fetch inventory')
+  }
+  return res.json() as Promise<InventoryItem[]>
 }
 
 /**
@@ -398,6 +615,8 @@ export async function apiCreateInventoryItem(payload: {
   min_stock_level?: number
   unit_cost?: number
   supplier?: string
+  expiration_date?: string | null
+  lead_time_days?: number
 }) {
   const headers = await getAuthHeader()
   const res = await fetch(`${API_BASE}/inventory`, {
@@ -413,14 +632,35 @@ export async function apiCreateInventoryItem(payload: {
 }
 
 /**
+ * DELETE /api/inventory/:id (Admin or Inventory Personnel)
+ * Permanently removes an inventory item along with its movement log and recipe links.
+ */
+export async function apiDeleteInventoryItem(id: string): Promise<{ deleted: boolean; id: string; name: string }> {
+  const res = await fetchAuthed(`${API_BASE}/inventory/${id}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) {
+    throw await toApiError(res, 'Failed to delete inventory item')
+  }
+  return res.json()
+}
+
+/**
  * GET /api/products
  */
 export async function apiGetProducts() {
   const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/products`, {
+  const res = await fetchWithRetry(`${API_BASE}/products`, {
     method: 'GET',
     headers,
   })
+  if (isGatewayDown(res)) {
+    const { data, error } = await supabase
+      .from('products')
+      .select('*, category:product_categories(id, name, sort_order), recipes:product_recipes(id, inventory_id, qty_per_unit, inventory:inventory(id, name, unit, stock_qty))')
+      .order('name')
+    if (!error && data) return data
+  }
   if (!res.ok) {
     throw await toApiError(res, 'Failed to fetch products')
   }
@@ -432,10 +672,17 @@ export async function apiGetProducts() {
  */
 export async function apiGetCategories() {
   const headers = await getAuthHeader()
-  const res = await fetch(`${API_BASE}/products/categories`, {
+  const res = await fetchWithRetry(`${API_BASE}/products/categories`, {
     method: 'GET',
     headers,
   })
+  if (isGatewayDown(res)) {
+    const { data, error } = await supabase
+      .from('product_categories')
+      .select('*')
+      .order('sort_order')
+    if (!error && data) return data
+  }
   if (!res.ok) {
     throw await toApiError(res, 'Failed to fetch categories')
   }
@@ -855,4 +1102,37 @@ export async function apiCreateCheckoutSession(payload: {
     sandbox_mock?: boolean
   }>
 }
+
+// --- Cashier Shifts --------------------------------
+
+/** POST /api/shifts/open */
+export async function apiOpenShift(payload: { opening_float: number; notes?: string }) {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/shifts/open`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: 'Failed to open shift' }))
+    throw new Error(err.message ?? 'Failed to open shift')
+  }
+  return res.json()
+}
+
+/** POST /api/shifts/close */
+export async function apiCloseShift(payload: { closing_cash: number; notes?: string }) {
+  const headers = await getAuthHeader()
+  const res = await fetch(`${API_BASE}/shifts/close`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: 'Failed to close shift' }))
+    throw new Error(err.message ?? 'Failed to close shift')
+  }
+  return res.json()
+}
+
 

@@ -41,6 +41,15 @@ const MENU_IMAGE_MIME: Record<string, string> = {
  */
 const PRODUCT_IMAGE_BUCKET = 'product-images'
 
+/**
+ * Ceiling on rows returned by `GET /api/products`.
+ *
+ * Generous enough that a full menu is never truncated (WINGTRACK seeds 27
+ * items), but present so the endpoint cannot become an unbounded table scan as
+ * the catalogue and its recipes grow.
+ */
+const MAX_PRODUCT_ROWS = 1000
+
 /** Rejects a malformed `:id` before it reaches Postgres. */
 function requireUuidParam(req: AuthenticatedRequest, res: Response): string | null {
   const id = String(req.params.id ?? '')
@@ -244,22 +253,42 @@ const rawImage = express.raw({ type: Object.keys(MENU_IMAGE_MIME), limit: MAX_ME
  * GET /api/products
  * List all products, optionally including inactive/unavailable items.
  * Authenticated users (cashier, admin, inventory) can view.
+ *
+ * The menu is a catalogue, not a log — a single read is what every consumer
+ * wants (POS grid, Menu Manager, recipe editor). It is capped rather than
+ * paged so that a runaway `recipes` join cannot pull an unbounded result set,
+ * while leaving normal operation completely unaffected.
  */
-router.get('/', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+router.get('/', requireAuth, async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { data, error } = await supabaseAdmin
       .from('products')
-      .select('*, category:product_categories(id, name, sort_order), recipes:product_recipes(id, inventory_id, qty_per_unit, inventory:inventory(name, unit, stock_qty))')
+      .select('*, category:product_categories(id, name, sort_order), recipes:product_recipes(id, inventory_id, qty_per_unit, inventory:inventory(name, unit, stock_qty, unit_cost))')
       .order('name')
+      .limit(MAX_PRODUCT_ROWS)
 
     if (error) throw error
     const typesMap = getAllProductTypes()
     const costsMap = getAllProductCosts()
-    const enriched = (data || []).map((p: any) => ({
-      ...p,
-      product_type: p.product_type || typesMap[p.id] || 'Regular',
-      unit_cost: p.unit_cost != null ? Number(p.unit_cost) : (costsMap[p.id] ?? 0),
-    }))
+    const enriched = (data || []).map((p: any) => {
+      const explicitCost = p.unit_cost != null && Number(p.unit_cost) > 0
+        ? Number(p.unit_cost)
+        : (costsMap[p.id] ?? 0)
+      const recipeCost = Array.isArray(p.recipes)
+        ? Math.round(
+            p.recipes.reduce((sum: number, r: any) => {
+              const qty = Number(r.qty_per_unit) || 0
+              const uCost = Number(r.inventory?.unit_cost) || 0
+              return sum + qty * uCost
+            }, 0) * 100
+          ) / 100
+        : 0
+      return {
+        ...p,
+        product_type: p.product_type || typesMap[p.id] || 'Regular',
+        unit_cost: explicitCost > 0 ? explicitCost : recipeCost,
+      }
+    })
     res.json(enriched)
   } catch (err: unknown) {
     console.error('[Products] Failed to list products:', err)

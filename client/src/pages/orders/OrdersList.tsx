@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { apiGetOrders, apiVoidOrder } from '@/lib/api'
+import { downloadCsv } from '@/lib/csv'
 import { dispatchNotification } from '@/lib/notifications'
 import type { Order, OrderSummary } from '@/types'
 import { useAuth } from '@/hooks/useAuth'
 import { useIsCompact } from '@/hooks/useMediaQuery'
 import ReceiptModal from '@/components/receipt/ReceiptModal'
+import ImportPreviousOrderModal from '@/components/orders/ImportPreviousOrderModal'
 
 /** One figure in the running-totals strip. */
 function StatTile({ label, value, hint }: { label: string; value: string; hint: string }) {
@@ -35,7 +37,9 @@ function StatTile({ label, value, hint }: { label: string; value: string; hint: 
 export function getOrderProfit(order: Order) {
   const isVoid = order.status === 'void'
   const items = order.order_items ?? []
-  const subtotal = Number(order.subtotal ?? order.total_amount) || 0
+  const rawSubtotal = Number(order.subtotal ?? order.total_amount) || 0
+  const discountAmt = Number(order.discount_amount ?? 0) || 0
+  const subtotal = Math.max(0, rawSubtotal - discountAmt)
   const totalCost = items.reduce((sum, item) => {
     const cost = Number(item.unit_cost ?? 0)
     const qty = Number(item.quantity ?? 1)
@@ -85,20 +89,27 @@ function OrderCard({
         <span style={{ fontFamily: 'IBM Plex Mono', fontWeight: 700, fontSize: 15, color: 'var(--foreground)' }}>
           #{order.order_number}
         </span>
-        <span
-          style={{
-            fontSize: 10,
-            padding: '3px 8px',
-            borderRadius: 12,
-            fontWeight: 700,
-            background: isVoid ? '#fee2e2' : '#e8f5e9',
-            color: isVoid ? '#b91c1c' : '#15803d',
-            textTransform: 'uppercase',
-            letterSpacing: '0.04em',
-          }}
-        >
-          {order.status}
-        </span>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {order.note === 'inserted' && (
+            <span style={{ fontSize: 9, padding: '3px 7px', borderRadius: 10, fontWeight: 700, background: '#fef3c7', color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+              Inserted · Previous Data
+            </span>
+          )}
+          <span
+            style={{
+              fontSize: 10,
+              padding: '3px 8px',
+              borderRadius: 12,
+              fontWeight: 700,
+              background: isVoid ? '#fee2e2' : '#e8f5e9',
+              color: isVoid ? '#b91c1c' : '#15803d',
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+            }}
+          >
+            {order.status}
+          </span>
+        </div>
       </div>
 
       {/* Row 2: when */}
@@ -116,7 +127,7 @@ function OrderCard({
                 {item.product_name}
               </span>
               <span style={{ fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', whiteSpace: 'nowrap' }}>
-                &#8369;{Number(item.line_total).toFixed(2)}
+                ₱{Number(item.line_total).toFixed(2)}
               </span>
             </li>
           ))}
@@ -155,7 +166,7 @@ function OrderCard({
               textDecoration: isVoid ? 'line-through' : 'none',
             }}
           >
-            &#8369;{Number(order.total_amount).toFixed(2)}
+            ₱{Number(order.total_amount).toFixed(2)}
           </div>
           {!isVoid && (
             <div
@@ -166,7 +177,7 @@ function OrderCard({
                 color: profit.netProfit >= 0 ? '#15803d' : '#b91c1c',
               }}
             >
-              Net Profit: {profit.netProfit >= 0 ? '+' : ''}&#8369;{profit.netProfit.toFixed(2)} ({profit.marginPct.toFixed(0)}%)
+              Net Profit: {profit.netProfit >= 0 ? '+' : ''}₱{profit.netProfit.toFixed(2)} ({profit.marginPct.toFixed(0)}%)
             </div>
           )}
         </div>
@@ -235,8 +246,12 @@ export default function OrdersList() {
   const [summary, setSummary] = useState<OrderSummary | null>(null)
   /** Success toast shown briefly after a void completes. */
   const [voidSuccessMsg, setVoidSuccessMsg] = useState<string | null>(null)
+  /** Import modal + toast for transferring a previous-system sale. */
+  const [importOpen, setImportOpen] = useState(false)
+  const [importSuccessMsg, setImportSuccessMsg] = useState<string | null>(null)
 
   const isCashier = role === 'cashier'
+  const isAdmin = role === 'admin'
 
   // Modals state
   const [selectedReceiptOrder, setSelectedReceiptOrder] = useState<Order | null>(null)
@@ -303,6 +318,71 @@ export default function OrdersList() {
     setVoidError(null)
   }, [])
 
+  function handleExportOrdersCsv() {
+    const today = new Date().toISOString().split('T')[0]
+    const headers = [
+      'Order #',
+      'Date & Time',
+      'Order Type',
+      'Table #',
+      'Cashier',
+      'Items Ordered',
+      'Payment Method',
+      'Payment Ref #',
+      'Discount Type',
+      'Discount (PHP)',
+      'Subtotal (PHP)',
+      'VAT 12% (PHP)',
+      'Total Amount (PHP)',
+      'Total Cost (PHP)',
+      'Net Profit (PHP)',
+      'Margin (%)',
+      'Status',
+      'Notes',
+    ]
+    const rows = filteredOrders.map(order => {
+      const dateStr = new Date(order.created_at).toLocaleString('en-PH', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      })
+      const itemsSummary = (order.order_items ?? [])
+        .map(i => `${i.quantity}x ${i.product_name}`)
+        .join('; ')
+      const profit = getOrderProfit(order)
+      const typeLabel =
+        order.order_type === 'take_out'
+          ? 'TAKE-OUT'
+          : order.order_type === 'delivery'
+            ? 'DELIVERY'
+            : 'DINE-IN'
+      return [
+        `#${order.order_number}`,
+        dateStr,
+        typeLabel,
+        order.table_number ?? '',
+        order.cashier?.full_name ?? 'Staff',
+        itemsSummary || 'No items',
+        order.payment_method.toUpperCase(),
+        order.payment_reference ?? '',
+        (order.discount_type ?? 'none').toUpperCase(),
+        Number(order.discount_amount ?? 0).toFixed(2),
+        Number(order.subtotal ?? 0).toFixed(2),
+        Number(order.vat_amount ?? 0).toFixed(2),
+        Number(order.total_amount ?? 0).toFixed(2),
+        profit.totalCost.toFixed(2),
+        profit.netProfit.toFixed(2),
+        profit.marginPct.toFixed(1),
+        order.status.toUpperCase(),
+        order.notes ?? '',
+      ]
+    })
+    downloadCsv(`wings-zone-transactions-${today}.csv`, headers, rows)
+  }
+
   async function handleConfirmVoid(e: React.FormEvent) {
     e.preventDefault()
     if (!voidModalOrder) return
@@ -332,6 +412,31 @@ export default function OrdersList() {
 
   return (
     <div className="page">
+      {/* Import success toast */}
+      {importSuccessMsg && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: 'fixed', bottom: 28, right: 24, zIndex: 9999,
+            display: 'flex', alignItems: 'center', gap: 12,
+            padding: '14px 18px', background: '#eff6ff', border: '1px solid #93c5fd',
+            borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.14)',
+            fontSize: 13, fontWeight: 600, color: '#1e40af', maxWidth: 420,
+            animation: 'toast-in 0.3s cubic-bezier(0.16,1,0.3,1)',
+          }}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+            <circle cx="12" cy="12" r="10" /><polyline points="9 12 11 14 15 10" />
+          </svg>
+          {importSuccessMsg}
+          <button type="button" onClick={() => setImportSuccessMsg(null)} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#1e40af', padding: 2 }} aria-label="Dismiss">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+      )}
       {/* Void success toast */}
       {voidSuccessMsg && (
         <div
@@ -358,8 +463,8 @@ export default function OrdersList() {
           }}
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-            <circle cx="12" cy="12" r="10"/>
-            <polyline points="9 12 11 14 15 10"/>
+            <circle cx="12" cy="12" r="10" />
+            <polyline points="9 12 11 14 15 10" />
           </svg>
           {voidSuccessMsg}
           <button
@@ -369,7 +474,7 @@ export default function OrdersList() {
             aria-label="Dismiss"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
             </svg>
           </button>
         </div>
@@ -384,26 +489,64 @@ export default function OrdersList() {
       {/* Header */}
       <div style={{ marginBottom: 24, display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
         <div>
+          <p className="overline" style={{ marginBottom: 6, textDecoration: 'none' }}>Wing&apos;s Zone · Order History</p>
           <h1 className="page-title" style={{ fontSize: 26 }}>
             {isCashier ? 'My Transactions' : 'Transactions'}
           </h1>
           <p className="page-subtitle">
             {isCashier
-              ? 'Your previous sales and customer orders — every order you have rung up'
-              : 'All store customer orders and transaction audits'}
+              ? "Your previous sales and customer orders at Wing's Zone — every order you have rung up"
+              : "All Wing's Zone customer orders and transaction audits"}
           </p>
         </div>
-        <button
-          onClick={fetchOrders}
-          className="btn-ghost"
-          style={{ padding: '8px 14px', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="23 4 23 10 17 10"/>
-            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-          </svg>
-          Refresh
-        </button>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          {isAdmin && (
+            <button
+              id="btn-import-previous-data"
+              type="button"
+              onClick={() => setImportOpen(true)}
+              className="btn-primary"
+              style={{ padding: '8px 14px', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              Input Previous Data
+            </button>
+          )}
+          <button
+            id="btn-export-orders-csv"
+            type="button"
+            onClick={handleExportOrdersCsv}
+            disabled={filteredOrders.length === 0}
+            className="btn-secondary"
+            style={{
+              padding: '8px 14px', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6,
+              cursor: filteredOrders.length === 0 ? 'not-allowed' : 'pointer',
+              opacity: filteredOrders.length === 0 ? 0.5 : 1,
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            Export CSV ({filteredOrders.length})
+          </button>
+          <button
+            onClick={fetchOrders}
+            className="btn-ghost"
+            style={{ padding: '8px 14px', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="23 4 23 10 17 10" />
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+            </svg>
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Running totals. Deliberately unfiltered — see the API's summary
@@ -506,148 +649,187 @@ export default function OrdersList() {
       ) : (
         <div className="card" style={{ overflow: 'hidden' }}>
           <div className="scroll-x">
-          <div style={{ display: 'grid', gridTemplateColumns: '62px 115px minmax(0, 1fr) 76px 90px 105px 84px 118px', gap: 0, padding: '12px 20px', borderBottom: '1px solid var(--border)', minWidth: 840 }}>
-            {['Order #', 'Date & Time', 'Items Summary', 'Payment', 'Total', 'Net Profit', 'Status', 'Actions'].map(h => (
-              <span key={h} style={{ fontSize: 11, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                {h}
-              </span>
-            ))}
-          </div>
-
-          {filteredOrders.map((order, i) => {
-            const isVoid = order.status === 'void'
-            const profit = getOrderProfit(order)
-            const dateStr = new Date(order.created_at).toLocaleString('en-PH', {
-              month: 'short',
-              day: 'numeric',
-              hour: 'numeric',
-              minute: '2-digit',
-              hour12: true,
-            })
-            const itemsSummary = (order.order_items ?? [])
-              .map(item => `${item.quantity}x ${item.product_name}`)
-              .join(', ')
-
-            return (
-              <div
-                key={order.id}
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: '62px 115px minmax(0, 1fr) 76px 90px 105px 84px 118px',
-                  gap: 0,
-                  padding: '14px 20px',
-                  borderBottom: i < filteredOrders.length - 1 ? '1px solid var(--muted)' : 'none',
-                  alignItems: 'center',
-                  background: isVoid ? 'rgba(254, 242, 242, 0.4)' : 'transparent',
-                  minWidth: 840,
-                }}
-              >
-                <span style={{ fontFamily: 'IBM Plex Mono', fontWeight: 700, fontSize: 13, color: 'var(--foreground)' }}>
-                  #{order.order_number}
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(72px, 0.5fr) minmax(145px, 1fr) minmax(220px, 1.8fr) minmax(95px, 0.75fr) minmax(105px, 0.85fr) minmax(115px, 0.9fr) minmax(105px, 0.8fr) minmax(140px, 0.9fr)', gap: 20, padding: '13px 24px', borderBottom: '1px solid var(--border)', minWidth: 1040, alignItems: 'center' }}>
+              {['Order #', 'Date & Time', 'Items Summary', 'Payment', 'Total', 'Net Profit', 'Status', 'Actions'].map((h, idx) => (
+                <span
+                  key={h}
+                  style={{
+                    fontSize: 11,
+                    fontFamily: 'IBM Plex Mono',
+                    color: 'var(--muted-foreground)',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.06em',
+                    textAlign: idx === 6 ? 'center' : idx === 7 ? 'right' : 'left',
+                  }}
+                >
+                  {h}
                 </span>
+              ))}
+            </div>
 
-                <span style={{ fontSize: 12, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono' }}>
-                  {dateStr}
-                </span>
+            {filteredOrders.map((order, i) => {
+              const isVoid = order.status === 'void'
+              const profit = getOrderProfit(order)
+              const dateStr = new Date(order.created_at).toLocaleString('en-PH', {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true,
+              })
+              const itemsSummary = (order.order_items ?? [])
+                .map(item => `${item.quantity}x ${item.product_name}`)
+                .join(', ')
 
-                <div style={{ paddingRight: 16, minWidth: 0 }}>
-                  <p style={{ fontSize: 13, fontWeight: 500, color: 'var(--foreground)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {itemsSummary || 'No items'}
-                  </p>
-                  {order.notes && (
-                    <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginTop: 2, fontStyle: 'italic' }}>
-                      {order.notes}
-                    </p>
-                  )}
-                </div>
-
-                <span style={{ fontSize: 12, textTransform: 'uppercase', fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)' }}>
-                  {order.payment_method}
-                </span>
-
-                <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: isVoid ? '#9ca3af' : 'var(--foreground)', textDecoration: isVoid ? 'line-through' : 'none' }}>
-                  ₱{Number(order.total_amount).toFixed(2)}
-                </span>
-
-                <div>
-                  {isVoid ? (
-                    <span style={{ fontSize: 12, fontFamily: 'IBM Plex Mono', color: '#9ca3af', textDecoration: 'line-through' }}>
-                      ₱0.00
-                    </span>
-                  ) : (
-                    <div>
-                      <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: profit.netProfit >= 0 ? '#15803d' : '#b91c1c' }}>
-                        {profit.netProfit >= 0 ? '+' : ''}₱{profit.netProfit.toFixed(2)}
-                      </span>
-                      <div style={{ fontSize: 10.5, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)' }}>
-                        {profit.marginPct.toFixed(0)}% margin
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <div>
-                  <span
-                    style={{
-                      fontSize: 11,
-                      padding: '3px 8px',
-                      borderRadius: 12,
-                      fontWeight: 600,
-                      background: isVoid ? '#fee2e2' : '#e8f5e9',
-                      color: isVoid ? '#b91c1c' : '#15803d',
-                      textTransform: 'uppercase',
-                    }}
-                  >
-                    {order.status}
+              return (
+                <div
+                  key={order.id}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(72px, 0.5fr) minmax(145px, 1fr) minmax(220px, 1.8fr) minmax(95px, 0.75fr) minmax(105px, 0.85fr) minmax(115px, 0.9fr) minmax(105px, 0.8fr) minmax(140px, 0.9fr)',
+                    gap: 20,
+                    padding: '14px 24px',
+                    borderBottom: i < filteredOrders.length - 1 ? '1px solid var(--muted)' : 'none',
+                    alignItems: 'center',
+                    background: isVoid ? 'rgba(254, 242, 242, 0.4)' : 'transparent',
+                    minWidth: 1040,
+                  }}
+                >
+                  <span style={{ fontFamily: 'IBM Plex Mono', fontWeight: 700, fontSize: 13, color: 'var(--foreground)' }}>
+                    #{order.order_number}
                   </span>
-                </div>
 
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <button
-                    onClick={() => setSelectedReceiptOrder(order)}
-                    style={{
-                      fontSize: 12,
-                      padding: '5px 9px',
-                      borderRadius: 6,
-                      border: '1px solid var(--border)',
-                      background: 'var(--card)',
-                      color: 'var(--foreground)',
-                      cursor: 'pointer',
-                      fontWeight: 500,
-                    }}
-                    title="View & Print Receipt"
-                  >
-                    Receipt
-                  </button>
+                  <span style={{ fontSize: 12, color: 'var(--muted-foreground)', fontFamily: 'IBM Plex Mono', whiteSpace: 'nowrap' }}>
+                    {dateStr}
+                  </span>
 
-                  {!isVoid && (
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 2 }}>
+                      <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'var(--muted)', color: 'var(--foreground)', fontFamily: 'IBM Plex Mono', fontWeight: 600 }}>
+                        {order.order_type === 'take_out'
+                          ? 'TAKE-OUT'
+                          : order.order_type === 'delivery'
+                            ? 'DELIVERY'
+                            : order.table_number
+                              ? `DINE-IN · ${order.table_number}`
+                              : 'DINE-IN'}
+                      </span>
+                      {(order.discount_type === 'senior' || order.discount_type === 'pwd') && (
+                        <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: '#e8f5e9', color: '#15803d', fontFamily: 'IBM Plex Mono', fontWeight: 700 }}>
+                          {order.discount_type === 'senior' ? 'SENIOR 20%' : 'PWD 20%'}
+                        </span>
+                      )}
+                      {order.note === 'inserted' && (
+                        <span style={{ fontSize: 9, padding: '1px 6px', borderRadius: 4, background: '#fef3c7', color: '#92400e', fontFamily: 'IBM Plex Mono', fontWeight: 700 }}>
+                          INSERTED · PREVIOUS DATA
+                        </span>
+                      )}
+                    </div>
+                    <p style={{ fontSize: 13, fontWeight: 500, color: 'var(--foreground)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {itemsSummary || 'No items'}
+                    </p>
+                    {order.notes && (
+                      <p style={{ fontSize: 11, color: 'var(--muted-foreground)', marginTop: 2, fontStyle: 'italic' }}>
+                        {order.notes}
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <span style={{ fontSize: 12, textTransform: 'uppercase', fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)', display: 'block' }}>
+                      {order.payment_method}
+                    </span>
+                    {order.payment_reference && (
+                      <span style={{ fontSize: 10.5, fontFamily: 'IBM Plex Mono', color: 'var(--primary)', display: 'block', marginTop: 2 }}>
+                        Ref: {order.payment_reference}
+                      </span>
+                    )}
+                  </div>
+
+                  <span style={{ fontSize: 14, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: isVoid ? '#9ca3af' : 'var(--foreground)', textDecoration: isVoid ? 'line-through' : 'none' }}>
+                    ₱{Number(order.total_amount).toFixed(2)}
+                  </span>
+
+                  <div>
+                    {isVoid ? (
+                      <span style={{ fontSize: 12, fontFamily: 'IBM Plex Mono', color: '#9ca3af', textDecoration: 'line-through' }}>
+                        ₱0.00
+                      </span>
+                    ) : (
+                      <div>
+                        <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono', fontWeight: 700, color: profit.netProfit >= 0 ? '#15803d' : '#b91c1c' }}>
+                          {profit.netProfit >= 0 ? '+' : ''}₱{profit.netProfit.toFixed(2)}
+                        </span>
+                        <div style={{ fontSize: 10.5, fontFamily: 'IBM Plex Mono', color: 'var(--muted-foreground)' }}>
+                          {profit.marginPct.toFixed(0)}% margin
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'center' }}>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        padding: '4px 10px',
+                        borderRadius: 12,
+                        fontWeight: 600,
+                        background: isVoid ? '#fee2e2' : '#e8f5e9',
+                        color: isVoid ? '#b91c1c' : '#15803d',
+                        textTransform: 'uppercase',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {order.status}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
                     <button
-                      onClick={() => openVoid(order)}
+                      onClick={() => setSelectedReceiptOrder(order)}
                       style={{
                         fontSize: 12,
-                        padding: '5px 9px',
+                        padding: '6px 11px',
                         borderRadius: 6,
-                        border: '1px solid #fecaca',
-                        background: '#fef2f2',
-                        color: '#b91c1c',
+                        border: '1px solid var(--border)',
+                        background: 'var(--card)',
+                        color: 'var(--foreground)',
                         cursor: 'pointer',
-                        fontWeight: 600,
+                        fontWeight: 500,
                       }}
-                      title="Void this transaction and reverse stock deductions"
+                      title="View & Print Receipt"
                     >
-                      Void
+                      Receipt
                     </button>
-                  )}
-                </div>
-              </div>
-            )
-          })}
 
-          {filteredOrders.length === 0 && (
-            <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--muted-foreground)', fontSize: 14 }}>
-              No orders found matching your criteria.
-            </div>
-          )}
+                    {!isVoid && (
+                      <button
+                        onClick={() => openVoid(order)}
+                        style={{
+                          fontSize: 12,
+                          padding: '6px 11px',
+                          borderRadius: 6,
+                          border: '1px solid #fecaca',
+                          background: '#fef2f2',
+                          color: '#b91c1c',
+                          cursor: 'pointer',
+                          fontWeight: 600,
+                        }}
+                        title="Void this transaction and reverse stock deductions"
+                      >
+                        Void
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+
+            {filteredOrders.length === 0 && (
+              <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--muted-foreground)', fontSize: 14 }}>
+                No orders found matching your criteria.
+              </div>
+            )}
           </div>
 
           {/* Pagination footer */}
@@ -685,6 +867,24 @@ export default function OrdersList() {
             </div>
           )}
         </div>
+      )}
+
+      {/* Previous-data import modal */}
+      {importOpen && (
+        <ImportPreviousOrderModal
+          onClose={() => setImportOpen(false)}
+          onImported={async (orderNumber) => {
+            setImportOpen(false)
+            setImportSuccessMsg(`Previous order #${orderNumber} has been saved and marked as inserted (previous data).`)
+            setTimeout(() => setImportSuccessMsg(null), 5000)
+            await fetchOrders()
+            dispatchNotification({
+              category: 'order',
+              title: 'Previous Data Imported',
+              body: `Order #${orderNumber} was transferred from the previous system.`,
+            })
+          }}
+        />
       )}
 
       {/* Receipt Modal */}
