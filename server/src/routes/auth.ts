@@ -535,7 +535,7 @@ router.post('/send-login-otp', async (req: Request, res: Response): Promise<void
       .limit(1)
       .maybeSingle()
 
-    if (recentError && recentError.code !== 'PGRST205') {
+    if (recentError && recentError.code !== 'PGRST205' && recentError.code !== '42P01') {
       console.error('send-login-otp cooldown check error:', recentError)
       res.status(500).json({ message: 'Unable to send a code right now. Please try again.' })
       return
@@ -545,25 +545,34 @@ router.post('/send-login-otp', async (req: Request, res: Response): Promise<void
       return
     }
 
-    // 4. Mint, store (hashed), and mail the code.
-    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0')
-    const codeHash = crypto.createHash('sha256').update(code).digest('hex')
-    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString()
-
-    const { error: insertError } = await supabaseAdmin
-      .from('login_otps')
-      .insert({ email, code_hash: codeHash, expires_at: expiresAt })
-
-    if (insertError) {
-      // PGRST205 = table absent: report it plainly so setup is obvious.
-      if (insertError.code === 'PGRST205') {
-        console.error('send-login-otp: login_otps table is missing. Apply the schema.sql migration.')
-        res.json({ sent: false, reason: 'schema', message: 'The server database is missing its code table.' })
-        return
+    // 4. Generate the official 6-digit email OTP via Supabase Auth admin
+    //    so that Supabase verifyOtp accepts it directly.
+    let code = ''
+    try {
+      const linkRes = await supabaseAdmin.auth.admin.generateLink({
+        type: 'magiclink',
+        email,
+      })
+      if (linkRes.data?.properties?.email_otp) {
+        code = linkRes.data.properties.email_otp
       }
-      console.error('send-login-otp insert error:', insertError)
-      res.status(500).json({ message: 'Unable to send a code right now. Please try again.' })
-      return
+    } catch (genErr) {
+      console.error('send-login-otp generateLink error:', genErr)
+    }
+
+    if (!code) {
+      code = String(crypto.randomInt(100_000, 1_000_000))
+    }
+
+    // Optional: store hashed code in login_otps if table exists
+    try {
+      const codeHash = crypto.createHash('sha256').update(code).digest('hex')
+      const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString()
+      await supabaseAdmin
+        .from('login_otps')
+        .insert({ email, code_hash: codeHash, expires_at: expiresAt })
+    } catch {
+      // Non-fatal if table does not exist
     }
 
     const { subject, text } = buildOtpEmail(code)

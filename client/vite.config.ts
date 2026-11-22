@@ -16,8 +16,8 @@ function ensureApiServerPlugin(apiTarget: string, serverDir: string): Plugin {
   let checking = false
 
   const parsed = new URL(apiTarget)
-  const port = Number(parsed.port) || 4100
-  const host = parsed.hostname || 'localhost'
+  const port = Number(parsed.port) || 4000
+  const host = parsed.hostname || '127.0.0.1'
 
   function isPortListening(): Promise<boolean> {
     return new Promise(resolve => {
@@ -75,7 +75,7 @@ export default defineConfig(({ mode }) => {
   // other then gets 404s from the wrong service. Set VITE_API_PROXY_TARGET in
   // .env.local to point at wherever the WINGTRACK API is actually listening.
   const env = loadEnv(mode, root, 'VITE_')
-  const apiTarget = env.VITE_API_PROXY_TARGET || 'http://localhost:4100'
+  const apiTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:4000'
 
   return {
     plugins: [react(), tailwindcss(), ensureApiServerPlugin(apiTarget, serverDir)],
