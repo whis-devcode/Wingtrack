@@ -76,11 +76,9 @@ export default function PointOfSale() {
   const [cart, setCart] = useState<CartItem[]>([])
   const [method, setMethod] = useState<'cash' | 'gcash' | 'maya' | 'card'>('cash')
   const [orderType, setOrderType] = useState<OrderType>('dine_in')
-  const [tableNumber, setTableNumber] = useState('')
   const [discountType, setDiscountType] = useState<DiscountType>('none')
   const [discountId, setDiscountId] = useState('')
   const [notes, setNotes] = useState('')
-  const [isManualEntry, setIsManualEntry] = useState(false)
   const [checkoutLoading, setCheckoutLoading] = useState(false)
   const [checkoutSuccess, setCheckoutSuccess] = useState(false)
   const [orderNum, setOrderNum] = useState<number | null>(null)
@@ -285,10 +283,8 @@ export default function PointOfSale() {
     const paymentMethod: 'cash' | 'gcash' | 'maya' | 'card' =
       method === 'cash' ? 'cash' : (onlineMethod ?? method)
     const trimmedNotes = notes.trim()
-    const finalNotes = isManualEntry
-      ? (trimmedNotes ? `[Manual / Post-Offline Entry] ${trimmedNotes}` : '[Manual / Post-Offline Entry]')
-      : trimmedNotes
-    const finalTable = orderType === 'dine_in' && tableNumber.trim() ? tableNumber.trim() : null
+    const finalNotes = trimmedNotes
+    const finalTable = null
     const finalDiscountId = isScPwd && discountId.trim() ? discountId.trim() : null
     const finalPaymentRef = paymentReference?.trim() || null
 
@@ -350,10 +346,8 @@ export default function PointOfSale() {
       })
       setCart([])
       setNotes('')
-      setIsManualEntry(false)
       setDiscountType('none')
       setDiscountId('')
-      setTableNumber('')
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Checkout failed')
     } finally {
@@ -647,27 +641,10 @@ export default function PointOfSale() {
             </div>
           </div>
 
-          {/* Manual / Post-Offline Entry toggle */}
-          <label
-            style={{
-              display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8,
-              fontSize: 12, color: isManualEntry ? 'var(--sidebar-active)' : 'var(--sidebar-muted)',
-              cursor: 'pointer', userSelect: 'none',
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={isManualEntry}
-              onChange={e => setIsManualEntry(e.target.checked)}
-              style={{ accentColor: 'var(--sidebar-active)', cursor: 'pointer' }}
-            />
-            <span>Manual / Post-Offline Entry (encoded after downtime)</span>
-          </label>
-
           {/* Notes */}
           <textarea
             className="sidebar-textarea"
-            placeholder={isManualEntry ? 'Optional: original time / manual receipt #...' : 'Order notes (optional)...'}
+            placeholder="Order notes (optional)..."
             value={notes}
             onChange={e => setNotes(e.target.value)}
             rows={1}
@@ -933,25 +910,9 @@ export default function PointOfSale() {
                 </div>
               </div>
 
-              <label
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8,
-                  fontSize: 12.5, color: isManualEntry ? 'var(--sidebar-active)' : 'var(--sidebar-muted)',
-                  cursor: 'pointer', userSelect: 'none',
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={isManualEntry}
-                  onChange={e => setIsManualEntry(e.target.checked)}
-                  style={{ accentColor: 'var(--sidebar-active)', cursor: 'pointer' }}
-                />
-                <span>Manual / Post-Offline Entry</span>
-              </label>
-
               <textarea
                 className="sidebar-textarea"
-                placeholder={isManualEntry ? 'Optional: original time / manual receipt #...' : 'Order notes (optional)...'}
+                placeholder="Order notes (optional)..."
                 value={notes}
                 onChange={e => setNotes(e.target.value)}
                 rows={1}
@@ -1104,13 +1065,13 @@ export default function PointOfSale() {
           total={total}
           subtotal={subtotal}
           vat={vat}
-          notes={isManualEntry ? (notes.trim() ? `[Manual / Post-Offline Entry] ${notes.trim()}` : '[Manual / Post-Offline Entry]') : notes}
+          notes={notes}
           cartItems={cart.map(c => ({ id: c.id, name: c.name, price: c.price, qty: c.qty }))}
           orderDescription={`Wing's Zone Order — ${cart.length} item${cart.length !== 1 ? 's' : ''}`}
           initialMethod={method === 'cash' ? undefined : method}
           orderMeta={{
             order_type: orderType,
-            table_number: orderType === 'dine_in' && tableNumber.trim() ? tableNumber.trim() : null,
+            table_number: null,
             discount_type: discountType,
             discount_id: isScPwd && discountId.trim() ? discountId.trim() : null,
             discount_amount: discountAmount,
