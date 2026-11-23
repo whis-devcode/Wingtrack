@@ -563,8 +563,23 @@ export default function OrdersList() {
           <StatTile
             label={isCashier ? 'Your transactions' : 'Transactions on record'}
             value={summary.transactions.toLocaleString('en-PH')}
-            hint="All time, voided orders included"
+            hint={
+              summary.completed != null && summary.voided != null
+                ? `${summary.completed.toLocaleString('en-PH')} completed · ${summary.voided.toLocaleString('en-PH')} voided${summary.latest_order_number && summary.latest_order_number > summary.transactions ? ` · Latest ref #${summary.latest_order_number}` : ''}`
+                : 'All time, voided orders included'
+            }
           />
+          {summary.completed != null && (
+            <StatTile
+              label={isCashier ? 'Your completed orders' : 'Completed orders'}
+              value={summary.completed.toLocaleString('en-PH')}
+              hint={
+                summary.voided
+                  ? `${summary.voided.toLocaleString('en-PH')} voided excluded from sales`
+                  : 'No voided orders'
+              }
+            />
+          )}
           <StatTile
             label={isCashier ? 'Your total sales' : 'Total sales'}
             value={`₱${summary.sales.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
@@ -585,25 +600,35 @@ export default function OrdersList() {
         />
 
         <div style={{ display: 'flex', gap: 6 }}>
-          {(['all', 'completed', 'void'] as const).map(s => (
-            <button
-              key={s}
-              onClick={() => setStatusFilter(s)}
-              style={{
-                padding: '7px 16px',
-                borderRadius: 20,
-                fontSize: 12,
-                cursor: 'pointer',
-                border: '1px solid var(--border)',
-                textTransform: 'capitalize',
-                background: statusFilter === s ? 'var(--primary)' : 'var(--card)',
-                color: statusFilter === s ? 'var(--primary-foreground)' : 'var(--muted-foreground)',
-                fontWeight: statusFilter === s ? 600 : 400,
-              }}
-            >
-              {s}
-            </button>
-          ))}
+          {(['all', 'completed', 'void'] as const).map(s => {
+            const pillCount =
+              summary
+                ? s === 'all'
+                  ? summary.transactions
+                  : s === 'completed'
+                    ? summary.completed
+                    : summary.voided
+                : undefined
+            return (
+              <button
+                key={s}
+                onClick={() => setStatusFilter(s)}
+                style={{
+                  padding: '7px 16px',
+                  borderRadius: 20,
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  border: '1px solid var(--border)',
+                  textTransform: 'capitalize',
+                  background: statusFilter === s ? 'var(--primary)' : 'var(--card)',
+                  color: statusFilter === s ? 'var(--primary-foreground)' : 'var(--muted-foreground)',
+                  fontWeight: statusFilter === s ? 600 : 400,
+                }}
+              >
+                {pillCount != null ? `${s} (${pillCount})` : s}
+              </button>
+            )
+          })}
         </div>
       </div>
 

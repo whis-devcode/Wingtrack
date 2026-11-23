@@ -141,8 +141,14 @@ export interface OrderItem {
 export interface OrderSummary {
   /** Every transaction on record for this scope, voids included. */
   transactions: number
+  /** Completed (non-void) transactions on record. */
+  completed?: number
+  /** Voided transactions on record. */
+  voided?: number
   /** Value of completed sales, voids excluded. */
   sales: number
+  /** Highest sequential order_number assigned (reference ID, not a row count). */
+  latest_order_number?: number
 }
 
 export interface CartItem extends Product {

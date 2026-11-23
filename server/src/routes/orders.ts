@@ -507,15 +507,24 @@ router.get(
        * the client hides the strip. A decorative total is never a reason for
        * the transaction list itself to fail.
        */
-      let summary: { transactions: number; sales: number } | null = null
+      let summary: {
+        transactions: number
+        completed: number
+        voided: number
+        sales: number
+        latest_order_number: number
+      } | null = null
       try {
         let transactions = 0
+        let completed = 0
+        let voided = 0
         let sales = 0
+        let latestOrderNumber = 0
 
         for (let page = 0; page < SUMMARY_MAX_PAGES; page += 1) {
           let pageQuery = supabaseAdmin
             .from('orders')
-            .select('status, total_amount')
+            .select('status, total_amount, order_number')
             .order('id', { ascending: true })
             .range(page * SUMMARY_PAGE_SIZE, page * SUMMARY_PAGE_SIZE + SUMMARY_PAGE_SIZE - 1)
 
@@ -529,14 +538,27 @@ router.get(
           const rows = pageRows ?? []
           for (const row of rows) {
             transactions += 1
-            if (row.status !== 'void') sales += Number(row.total_amount) || 0
+            const num = Number((row as { order_number?: number }).order_number) || 0
+            if (num > latestOrderNumber) latestOrderNumber = num
+            if (row.status === 'void') {
+              voided += 1
+            } else {
+              completed += 1
+              sales += Number(row.total_amount) || 0
+            }
           }
 
           // A short page means the table has been fully walked.
           if (rows.length < SUMMARY_PAGE_SIZE) break
         }
 
-        summary = { transactions, sales }
+        summary = {
+          transactions,
+          completed,
+          voided,
+          sales: Math.round(sales * 100) / 100,
+          latest_order_number: latestOrderNumber,
+        }
       } catch (summaryError) {
         console.error('Fetch orders — summary failed:', summaryError)
       }
