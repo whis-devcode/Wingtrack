@@ -23,6 +23,7 @@ function AppContent() {
   const [authMode, setAuthMode] = useState<AuthMode>(detectInitialMode)
   const [pendingEmail, setPendingEmail] = useState<string>('')
   const [pendingDevOtp, setPendingDevOtp] = useState<string | undefined>(undefined)
+  const [loginPrefill, setLoginPrefill] = useState<{ tab: 'email' | 'otp'; email: string } | null>(null)
   const [isOnline, setIsOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true
   )
@@ -222,7 +223,17 @@ function AppContent() {
   if (session) return <AppShell />
 
   // ── Unauthenticated pages ─────────────────────────────────
-  if (authMode === 'forgot') return <ForgotPasswordPage onBack={() => setAuthMode('login')} />
+  if (authMode === 'forgot') {
+    return (
+      <ForgotPasswordPage
+        onBack={() => { setLoginPrefill(null); setAuthMode('login') }}
+        onSignInWithOtp={(email) => {
+          setLoginPrefill({ tab: 'otp', email })
+          setAuthMode('login')
+        }}
+      />
+    )
+  }
 
   if (authMode === 'signup' && import.meta.env.VITE_ALLOW_PUBLIC_SIGNUP === 'true') {
     return (
@@ -239,8 +250,11 @@ function AppContent() {
 
   return (
     <LoginPage
-      onSwitchToSignUp={() => setAuthMode('signup')}
-      onForgotPassword={() => setAuthMode('forgot')}
+      key={loginPrefill ? `${loginPrefill.tab}:${loginPrefill.email}` : 'default'}
+      initialTab={loginPrefill?.tab}
+      initialEmail={loginPrefill?.email}
+      onSwitchToSignUp={() => { setLoginPrefill(null); setAuthMode('signup') }}
+      onForgotPassword={() => { setLoginPrefill(null); setAuthMode('forgot') }}
     />
   )
 }

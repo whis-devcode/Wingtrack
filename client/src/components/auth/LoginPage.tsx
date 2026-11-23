@@ -5,6 +5,8 @@ import AuthShell from './AuthShell'
 interface LoginPageProps {
   onSwitchToSignUp?: () => void
   onForgotPassword?: () => void
+  initialTab?: LoginTab
+  initialEmail?: string
 }
 
 type LoginTab = 'email' | 'otp'
@@ -49,10 +51,10 @@ const ShieldIcon = () => (
   </svg>
 )
 
-export default function LoginPage({ onSwitchToSignUp, onForgotPassword }: LoginPageProps) {
+export default function LoginPage({ onSwitchToSignUp, onForgotPassword, initialTab = 'email', initialEmail = '' }: LoginPageProps) {
   const { signIn, signInWithGoogle, sendLoginOtp, verifyLoginOtp } = useAuth()
-  const [tab, setTab] = useState<LoginTab>('email')
-  const [email, setEmail] = useState('')
+  const [tab, setTab] = useState<LoginTab>(initialTab)
+  const [email, setEmail] = useState(initialEmail)
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -61,7 +63,7 @@ export default function LoginPage({ onSwitchToSignUp, onForgotPassword }: LoginP
 
   // ── OTP sign-in state ─────────────────────────────────────
   const [otpStage, setOtpStage] = useState<'request' | 'verify'>('request')
-  const [otpEmail, setOtpEmail] = useState('')
+  const [otpEmail, setOtpEmail] = useState(initialEmail)
   const [otpDigits, setOtpDigits] = useState(['', '', '', '', '', ''])
   const [otpError, setOtpError] = useState<string | null>(null)
   const [otpInfo, setOtpInfo] = useState<string | null>(null)
@@ -109,6 +111,11 @@ export default function LoginPage({ onSwitchToSignUp, onForgotPassword }: LoginP
   }, [resendCooldown])
 
   function switchTab(next: LoginTab) {
+    if (next === 'otp' && !otpEmail.trim() && email.trim()) {
+      setOtpEmail(email.trim())
+    } else if (next === 'email' && !email.trim() && otpEmail.trim()) {
+      setEmail(otpEmail.trim())
+    }
     setTab(next)
     setError(null)
     setOtpError(null)
@@ -393,7 +400,7 @@ export default function LoginPage({ onSwitchToSignUp, onForgotPassword }: LoginP
           <>
             {otpStage === 'request' ? (
               <>
-                {/* Registered-staff notice */}
+                {/* OTP sign-in info */}
                 <div style={{ background: 'rgba(234,88,12,0.07)', border: '1px solid rgba(234,88,12,0.2)', borderRadius: 10, padding: '12px 14px', display: 'flex', gap: 10 }}>
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#c2410c" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: 1 }}>
                     <circle cx="12" cy="12" r="10"/>
@@ -401,15 +408,15 @@ export default function LoginPage({ onSwitchToSignUp, onForgotPassword }: LoginP
                     <line x1="12" y1="8" x2="12.01" y2="8"/>
                   </svg>
                   <p style={{ fontSize: 12.5, color: '#7c2d12', lineHeight: 1.5, margin: 0 }}>
-                    Code sign-in is for <strong>registered staff only</strong>. If you have not been
-                    given an account yet, ask an administrator to create one first.
+                    Already have a staff account? Enter your email and we&apos;ll send a{' '}
+                    <strong>6-digit sign-in code</strong> directly to your inbox — no admin approval needed.
                   </p>
                 </div>
 
                 {/* Email */}
                 <div>
                   <label htmlFor="otp-email" style={{ display: 'block', fontSize: 14, fontWeight: 600, color: 'var(--foreground)', marginBottom: 8 }}>
-                    Registered Email Address
+                    Email Address
                   </label>
                   <div className="auth-field">
                     <span className="auth-field__icon" aria-hidden="true">

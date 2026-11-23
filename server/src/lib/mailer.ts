@@ -69,14 +69,22 @@ export async function sendMail(opts: {
   const config = getSmtpConfig()
   if (!config) return { configured: false, delivered: false }
 
-  try {
-    await deliver(config, opts)
-    return { configured: true, delivered: true }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    console.error('[mailer] delivery failed:', message)
-    return { configured: true, delivered: false, error: message }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await deliver(config, opts)
+      return { configured: true, delivered: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const transient = /timed out|closed unexpectedly|ECONNRESET|ETIMEDOUT/i.test(message)
+      if (attempt === 0 && transient) {
+        console.warn('[mailer] transient delivery error, retrying once:', message)
+        continue
+      }
+      console.error('[mailer] delivery failed:', message)
+      return { configured: true, delivered: false, error: message }
+    }
   }
+  return { configured: true, delivered: false, error: 'Delivery failed' }
 }
 
 function deliver(
@@ -91,7 +99,7 @@ function deliver(
       },
     )
 
-    socket.setTimeout(15_000)
+    socket.setTimeout(20_000)
 
     let buffer = ''
     let step = 0

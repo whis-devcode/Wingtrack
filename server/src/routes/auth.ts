@@ -137,6 +137,45 @@ function safeRedirectTarget(requested: string): string {
  * uniform in shape and timing-irrelevant, and the endpoint is rate-limited at
  * the edge alongside the rest of the auth surface.
  */
+/**
+ * Looks up a staff profile by email (case-insensitive).
+ *
+ * First checks `staff_profiles.email`. If not found there (e.g. an existing
+ * auth account whose profile email drifted out of sync), checks `auth.users`
+ * for that email and resolves the linked `staff_profiles` row by `user_id`.
+ */
+async function findStaffByEmail(
+  email: string,
+): Promise<{ data: { id: string; user_id: string | null; email: string; is_active: boolean } | null; error: unknown }> {
+  const { data, error } = await supabaseAdmin
+    .from('staff_profiles')
+    .select('id, user_id, email, is_active')
+    .ilike('email', email)
+    .maybeSingle()
+
+  if (error) return { data: null, error }
+  if (data) return { data, error: null }
+
+  // Fallback: match against Supabase Auth users and resolve via user_id.
+  try {
+    const { data: usersData } = await supabaseAdmin.auth.admin.listUsers({ perPage: 200 })
+    const authUser = usersData?.users?.find(u => u.email?.trim().toLowerCase() === email)
+    if (authUser) {
+      const { data: byUserId, error: byIdErr } = await supabaseAdmin
+        .from('staff_profiles')
+        .select('id, user_id, email, is_active')
+        .eq('user_id', authUser.id)
+        .maybeSingle()
+      if (byIdErr) return { data: null, error: byIdErr }
+      if (byUserId) return { data: byUserId, error: null }
+    }
+  } catch (err) {
+    console.warn('findStaffByEmail auth fallback error:', err)
+  }
+
+  return { data: null, error: null }
+}
+
 router.post('/check-registered', async (req: Request, res: Response): Promise<void> => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
 
@@ -146,11 +185,7 @@ router.post('/check-registered', async (req: Request, res: Response): Promise<vo
   }
 
   try {
-    const { data, error } = await supabaseAdmin
-      .from('staff_profiles')
-      .select('is_active')
-      .ilike('email', email)
-      .maybeSingle()
+    const { data, error } = await findStaffByEmail(email)
 
     if (error) {
       console.error('check-registered lookup error:', error)
@@ -501,11 +536,7 @@ router.post('/send-login-otp', async (req: Request, res: Response): Promise<void
 
   try {
     // 1. Only provisioned, active staff may receive a code.
-    const { data: staff, error: staffError } = await supabaseAdmin
-      .from('staff_profiles')
-      .select('is_active')
-      .ilike('email', email)
-      .maybeSingle()
+    const { data: staff, error: staffError } = await findStaffByEmail(email)
 
     if (staffError) {
       console.error('send-login-otp staff lookup error:', staffError)
@@ -619,11 +650,7 @@ router.post('/send-password-reset', async (req: Request, res: Response): Promise
 
   try {
     // 1. Only provisioned, active staff may reset a password.
-    const { data: staff, error: staffError } = await supabaseAdmin
-      .from('staff_profiles')
-      .select('is_active')
-      .ilike('email', email)
-      .maybeSingle()
+    const { data: staff, error: staffError } = await findStaffByEmail(email)
 
     if (staffError) {
       console.error('send-password-reset staff lookup error:', staffError)

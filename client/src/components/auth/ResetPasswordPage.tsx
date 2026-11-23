@@ -87,7 +87,7 @@ function OtpInput({ value, onChange }: { value: string[]; onChange: (v: string[]
 }
 
 export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
-  const { updatePassword } = useAuth()
+  const { updatePassword, sendLoginOtp } = useAuth()
 
   // Step management
   const [step, setStep] = useState<Step>('choose')
@@ -99,6 +99,14 @@ export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
   const [otpLoading, setOtpLoading] = useState(false)
   const [otpError, setOtpError] = useState<string | null>(null)
   const [resendCooldown, setResendCooldown] = useState(0)
+
+  // Pre-fill the email address when arriving via a recovery link session.
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      const sessionEmail = data.session?.user?.email
+      if (sessionEmail) setEmail(prev => prev || sessionEmail)
+    }).catch(() => undefined)
+  }, [])
 
   // 5-minute OTP expiry
   const OTP_EXPIRY = 300
@@ -146,18 +154,16 @@ export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
     if (!email.trim()) { setOtpError('Please enter your email address.'); return }
     setOtpError(null); setOtpLoading(true)
     try {
-      // Use Supabase email OTP for password recovery
-      const { error } = await supabase.auth.signInWithOtp({
-        email: email.trim(),
-        options: { shouldCreateUser: false },
-      })
-      if (error) throw error
+      // Send via our server SMTP relay (falls back to Supabase when SMTP is unset)
+      await sendLoginOtp(email.trim())
+      setExpiry(OTP_EXPIRY)
+      setExpired(false)
       setResendCooldown(60)
       setStep('verify-email')
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to send OTP. Please try again.'
       if (msg.toLowerCase().includes('rate limit')) {
-        setOtpError('Rate limit reached: Too many emails requested. Please wait a short while or configure custom SMTP in Supabase.')
+        setOtpError('Rate limit reached: Too many emails requested. Please wait a short while before requesting another code.')
       } else {
         setOtpError(msg)
       }

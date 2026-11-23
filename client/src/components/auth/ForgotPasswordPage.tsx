@@ -4,9 +4,10 @@ import AuthShell from './AuthShell'
 
 interface ForgotPasswordPageProps {
   onBack: () => void
+  onSignInWithOtp?: (email: string) => void
 }
 
-export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) {
+export default function ForgotPasswordPage({ onBack, onSignInWithOtp }: ForgotPasswordPageProps) {
   const { sendPasswordReset } = useAuth()
   const [email, setEmail] = useState('')
   const [loading, setLoading] = useState(false)
@@ -102,14 +103,30 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
                 try again
               </button>.
             </p>
-            <button
-              id="forgot-back-to-login"
-              onClick={onBack}
-              className="btn-primary"
-              style={{ width: '100%', padding: '13px', fontSize: 15, fontWeight: 600, borderRadius: 10 }}
-            >
-              Back to Sign In
-            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <button
+                id="forgot-back-to-login"
+                onClick={onBack}
+                className="btn-primary"
+                style={{ width: '100%', padding: '13px', fontSize: 15, fontWeight: 600, borderRadius: 10 }}
+              >
+                Back to Sign In
+              </button>
+              {onSignInWithOtp && (
+                <button
+                  type="button"
+                  id="forgot-use-otp"
+                  onClick={() => onSignInWithOtp(email.trim())}
+                  style={{
+                    width: '100%', padding: '11px', fontSize: 13.5, fontWeight: 600, borderRadius: 10,
+                    background: 'transparent', border: '1px solid var(--border)',
+                    color: 'var(--foreground)', cursor: 'pointer',
+                  }}
+                >
+                  Sign in with Email OTP instead
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -172,7 +189,24 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
               )}
             </button>
 
-            <div style={{ textAlign: 'center' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
+              {onSignInWithOtp && (
+                <button
+                  type="button"
+                  id="forgot-switch-otp"
+                  onClick={() => onSignInWithOtp(email.trim())}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: 'var(--primary)',
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Or sign in directly with an Email OTP code
+                </button>
+              )}
               <button
                 type="button"
                 id="forgot-back-btn"
