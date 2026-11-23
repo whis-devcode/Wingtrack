@@ -558,9 +558,9 @@ export default function PointOfSale() {
             </div>
           )}
 
-          {/* Order Type (Dine-In, Take-Out) & Table # */}
+          {/* Order Type (Dine-In, Take-Out) */}
           <div style={{ marginBottom: 10 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 6, marginBottom: orderType === 'dine_in' ? 6 : 0 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 6 }}>
               {([
                 { key: 'dine_in',  label: 'Dine-In' },
                 { key: 'take_out', label: 'Take-Out' },
@@ -581,23 +581,6 @@ export default function PointOfSale() {
                 </button>
               ))}
             </div>
-            {orderType === 'dine_in' && (
-              <select
-                id="pos-table-select"
-                value={tableNumber}
-                onChange={e => setTableNumber(e.target.value)}
-                style={{
-                  width: '100%', padding: '6px 10px', borderRadius: 6, fontSize: 12,
-                  border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)',
-                  color: 'var(--sidebar-foreground)', outline: 'none',
-                }}
-              >
-                <option value="" style={{ color: '#111' }}>Table # (Optional — Counter / Walk-In)</option>
-                {Array.from({ length: 12 }, (_, i) => `Table ${i + 1}`).map(t => (
-                  <option key={t} value={t} style={{ color: '#111' }}>{t}</option>
-                ))}
-              </select>
-            )}
           </div>
 
           {/* Statutory Discount (None / Senior Citizen 20% / PWD 20%) */}
