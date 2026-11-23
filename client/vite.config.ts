@@ -59,7 +59,7 @@ function ensureApiServerPlugin(apiTarget: string, serverDir: string): Plugin {
   return {
     name: 'wingtrack-ensure-api-server',
     configureServer() {
-      void ensureRunning()
+      // Give dev:server a chance to bind port 4000 on startup before auto-spawning
       const timer = setInterval(() => { void ensureRunning() }, 5000)
       timer.unref?.()
     },
