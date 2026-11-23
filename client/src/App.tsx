@@ -108,13 +108,13 @@ function AppContent() {
     )
   }
 
-  // ── Password Reset page ───────────────────────────────────
+  // ── Password Reset / Forgot Password pages ────────────────
   // Deliberately rendered before the `loading` and `if (session)` branches.
-  // A recovery link signs the user in, so waiting on the session would let the
-  // app briefly treat them as authenticated and flash the main interface —
-  // and the session must not be consulted at all while they are resetting.
-  // updatePassword() clears the session once the new password is saved, so
-  // finishing the flow lands on the login page.
+  // Verifying a recovery OTP (or following a recovery link) signs the user in
+  // temporarily so updateUser({ password }) is authorized; waiting on the
+  // session would prematurely render AppShell before they choose a new
+  // password. updatePassword() clears the session once the new password is
+  // saved, so finishing either flow lands cleanly on the login page.
   if (authMode === 'reset') {
     return (
       <ResetPasswordPage
@@ -122,6 +122,18 @@ function AppContent() {
           // Strip both the query flag and the recovery hash so a refresh cannot
           // re-enter the reset flow with a stale token.
           window.history.replaceState({}, '', window.location.pathname)
+          setAuthMode('login')
+        }}
+      />
+    )
+  }
+
+  if (authMode === 'forgot') {
+    return (
+      <ForgotPasswordPage
+        onBack={() => { setLoginPrefill(null); setAuthMode('login') }}
+        onSignInWithOtp={(email) => {
+          setLoginPrefill({ tab: 'otp', email })
           setAuthMode('login')
         }}
       />
@@ -223,18 +235,6 @@ function AppContent() {
   if (session) return <AppShell />
 
   // ── Unauthenticated pages ─────────────────────────────────
-  if (authMode === 'forgot') {
-    return (
-      <ForgotPasswordPage
-        onBack={() => { setLoginPrefill(null); setAuthMode('login') }}
-        onSignInWithOtp={(email) => {
-          setLoginPrefill({ tab: 'otp', email })
-          setAuthMode('login')
-        }}
-      />
-    )
-  }
-
   if (authMode === 'signup' && import.meta.env.VITE_ALLOW_PUBLIC_SIGNUP === 'true') {
     return (
       <SignUpPage

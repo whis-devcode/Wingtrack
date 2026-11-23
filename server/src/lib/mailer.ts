@@ -252,3 +252,30 @@ export function buildPasswordResetEmail(link: string): { subject: string; text: 
     ].join('\n'),
   }
 }
+
+/**
+ * The email body for a password reset 6-digit OTP code.
+ *
+ * Sending a code instead of a clickable redirect link avoids link-scanner
+ * pre-fetches burning single-use tokens and works even when staff read their
+ * email on a different device (e.g. a phone while sitting at the POS).
+ */
+export function buildPasswordResetOtpEmail(code: string): { subject: string; text: string } {
+  return {
+    subject: `Your WINGTRACK password reset code: ${code}`,
+    text: [
+      "WINGTRACK — Wing's Zone",
+      '',
+      'Someone asked to reset the password for this WINGTRACK account.',
+      '',
+      `Your 6-digit password reset code is: ${code}`,
+      '',
+      'Enter this code on the Reset Password screen to choose a new password.',
+      'This code expires in 5 minutes and can only be used once.',
+      'If you did not request a password reset, you can safely ignore this email —',
+      'your password will not change.',
+      '',
+      '— WINGTRACK POS',
+    ].join('\n'),
+  }
+}

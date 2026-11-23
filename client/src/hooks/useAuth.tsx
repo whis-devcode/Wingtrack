@@ -96,6 +96,8 @@ interface AuthContextValue {
   signOut: () => Promise<void>
   signInWithGoogle: () => Promise<void>
   sendPasswordReset: (email: string) => Promise<PasswordResetOutcome>
+  /** Verifies a 6-digit password-reset OTP, establishing a recovery session. */
+  verifyPasswordResetOtp: (email: string, token: string) => Promise<void>
   updatePassword: (newPassword: string) => Promise<void>
   /**
    * Looks up whether an email belongs to a provisioned, active staff member.
@@ -436,6 +438,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return 'unconfirmed'
   }
 
+  /** Verifies a 6-digit password-reset OTP, establishing a recovery session. */
+  async function verifyPasswordResetOtp(email: string, token: string) {
+    const normalized = email.trim().toLowerCase()
+    const { error } = await supabase.auth.verifyOtp({
+      email: normalized,
+      token,
+      type: 'recovery',
+    })
+    if (error) {
+      const { error: fallbackErr } = await supabase.auth.verifyOtp({
+        email: normalized,
+        token,
+        type: 'email',
+      })
+      if (fallbackErr) throw new Error(describeOtpError(error.message))
+    }
+  }
+
   /**
    * Completes a password reset.
    *
@@ -537,7 +557,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ session, user, profile, role: profile?.role ?? null, loading, accountState, sessionOrigin, refreshProfile, signIn, signUp, signOut, signInWithGoogle, sendPasswordReset, updatePassword, checkStaffRegistered, sendLoginOtp, verifyLoginOtp }}
+      value={{ session, user, profile, role: profile?.role ?? null, loading, accountState, sessionOrigin, refreshProfile, signIn, signUp, signOut, signInWithGoogle, sendPasswordReset, verifyPasswordResetOtp, updatePassword, checkStaffRegistered, sendLoginOtp, verifyLoginOtp }}
     >
       {children}
     </AuthContext.Provider>

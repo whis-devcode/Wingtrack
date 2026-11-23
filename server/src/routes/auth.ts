@@ -3,7 +3,7 @@ import crypto from 'node:crypto'
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth'
 import { requireRole } from '../middleware/rbac'
 import { supabaseAdmin } from '../lib/supabase'
-import { sendMail, isSmtpConfigured, buildOtpEmail, buildPasswordResetEmail } from '../lib/mailer'
+import { sendMail, isSmtpConfigured, buildOtpEmail, buildPasswordResetOtpEmail } from '../lib/mailer'
 import { validatePassword } from '../lib/validation'
 
 const router = Router()
@@ -691,7 +691,10 @@ router.post('/send-password-reset', async (req: Request, res: Response): Promise
       return
     }
 
-    // 4. Mint the recovery link. This does NOT send an email — we deliver it.
+    // 4. Mint a 6-digit recovery OTP via Supabase Auth admin (does NOT send
+    //    mail — we deliver it ourselves). Using the 6-digit OTP avoids broken
+    //    localhost links and prevents email scanners from burning single-use
+    //    recovery links before the user clicks them.
     const redirectTo = safeRedirectTarget(requestedRedirect)
     const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
       type: 'recovery',
@@ -699,32 +702,32 @@ router.post('/send-password-reset', async (req: Request, res: Response): Promise
       options: { redirectTo },
     })
 
-    const actionLink = linkData?.properties?.action_link
+    const code = linkData?.properties?.email_otp
 
-    if (linkError || !actionLink) {
+    if (linkError || !code) {
       console.error('send-password-reset generateLink error:', linkError)
       res.status(502).json({
-        message: 'Unable to create a reset link for this account. Ask an administrator to check the mail settings.',
+        message: 'Unable to create a reset code for this account. Ask an administrator to check the mail settings.',
         reason: 'delivery',
       })
       return
     }
 
-    // 5. Deliver it ourselves.
-    const { subject, text } = buildPasswordResetEmail(actionLink)
+    // 5. Deliver the 6-digit reset OTP via our own SMTP relay.
+    const { subject, text } = buildPasswordResetOtpEmail(code)
     const delivery = await sendMail({ to: email, subject, text })
 
     if (!delivery.delivered) {
       res.status(502).json({
-        message: 'The reset link could not be emailed. An administrator needs to check the mail settings.',
+        message: 'The reset code could not be emailed. An administrator needs to check the mail settings.',
         reason: 'delivery',
       })
       return
     }
 
-    // Only start the cooldown once a link has actually gone out.
+    // Only start the cooldown once a code has actually gone out.
     resetCooldowns.set(email, Date.now() + RESET_COOLDOWN_MS)
-    res.json({ sent: true })
+    res.json({ sent: true, mode: 'otp' })
   } catch (err: unknown) {
     console.error('send-password-reset error:', err)
     res.status(500).json({ message: 'Unable to send a reset link right now. Please try again.' })

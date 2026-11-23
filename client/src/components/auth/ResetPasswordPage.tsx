@@ -87,7 +87,7 @@ function OtpInput({ value, onChange }: { value: string[]; onChange: (v: string[]
 }
 
 export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
-  const { updatePassword, sendLoginOtp } = useAuth()
+  const { updatePassword, sendPasswordReset, verifyPasswordResetOtp } = useAuth()
 
   // Step management
   const [step, setStep] = useState<Step>('choose')
@@ -100,12 +100,36 @@ export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
   const [otpError, setOtpError] = useState<string | null>(null)
   const [resendCooldown, setResendCooldown] = useState(0)
 
-  // Pre-fill the email address when arriving via a recovery link session.
+  // Handle arriving from a recovery link: if the link succeeded, skip straight
+  // to the New Password step; if the link expired, show a clear message so the
+  // user can request a 6-digit Email OTP right here.
   useEffect(() => {
+    const hash = window.location.hash
+    if (hash.includes('error=')) {
+      const hashParams = new URLSearchParams(hash.replace(/^#/, ''))
+      const desc = hashParams.get('error_description')
+      setOtpError(
+        desc
+          ? `${desc.replace(/\+/g, ' ')}. Enter your email below to receive a 6-digit reset code instead.`
+          : 'That reset link is invalid or has expired. Enter your email below to receive a 6-digit reset code instead.'
+      )
+      return
+    }
+
     supabase.auth.getSession().then(({ data }) => {
-      const sessionEmail = data.session?.user?.email
-      if (sessionEmail) setEmail(prev => prev || sessionEmail)
+      if (data.session?.user) {
+        if (data.session.user.email) setEmail(prev => prev || data.session!.user.email!)
+        setStep('new-password')
+      }
     }).catch(() => undefined)
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, sess) => {
+      if (event === 'PASSWORD_RECOVERY' && sess?.user) {
+        if (sess.user.email) setEmail(prev => prev || sess.user.email!)
+        setStep('new-password')
+      }
+    })
+    return () => sub.subscription.unsubscribe()
   }, [])
 
   // 5-minute OTP expiry
@@ -154,8 +178,8 @@ export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
     if (!email.trim()) { setOtpError('Please enter your email address.'); return }
     setOtpError(null); setOtpLoading(true)
     try {
-      // Send via our server SMTP relay (falls back to Supabase when SMTP is unset)
-      await sendLoginOtp(email.trim())
+      // Send a 6-digit recovery OTP via our server SMTP relay
+      await sendPasswordReset(email.trim())
       setExpiry(OTP_EXPIRY)
       setExpired(false)
       setResendCooldown(60)
@@ -203,10 +227,12 @@ export default function ResetPasswordPage({ onDone }: ResetPasswordPageProps) {
     setOtpError(null); setOtpLoading(true)
     try {
       const isPhone = step === 'verify-phone'
-      const { error } = isPhone
-        ? await supabase.auth.verifyOtp({ phone: phone.trim(), token: code, type: 'sms' })
-        : await supabase.auth.verifyOtp({ email: email.trim(), token: code, type: 'email' })
-      if (error) throw error
+      if (isPhone) {
+        const { error } = await supabase.auth.verifyOtp({ phone: phone.trim(), token: code, type: 'sms' })
+        if (error) throw error
+      } else {
+        await verifyPasswordResetOtp(email.trim(), code)
+      }
       setStep('new-password')
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : ''
