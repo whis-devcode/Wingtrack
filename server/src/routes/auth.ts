@@ -551,7 +551,6 @@ router.post('/send-login-otp', async (req: Request, res: Response): Promise<void
       res.status(500).json({ message: 'Unable to generate a sign-in code right now. Please try again.' })
       return
     }
-    }
 
     // 5. Email the code through our own SMTP relay (e.g. Gmail App Password).
     const { subject, text } = buildOtpEmail(code)
