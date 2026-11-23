@@ -62,6 +62,7 @@ export default function ImportPreviousOrderModal({
   const [lines, setLines] = useState<DraftLine[]>([newLine()])
   const [paymentMethod, setPaymentMethod] = useState<string>('cash')
   const [orderType, setOrderType] = useState<OrderType>('dine_in')
+  const [tableNumber, setTableNumber] = useState('')
   const [discountType, setDiscountType] = useState<DiscountType>('none')
   const [discountId, setDiscountId] = useState('')
   const [paymentReference, setPaymentReference] = useState('')
@@ -131,7 +132,7 @@ export default function ImportPreviousOrderModal({
       items,
       payment_method: paymentMethod as ImportOrderPayload['payment_method'],
       order_type: orderType,
-      table_number: null,
+      table_number: orderType === 'dine_in' && tableNumber.trim() ? tableNumber.trim() : null,
       discount_type: discountType,
         discount_id: discountType !== 'none' && discountId.trim() ? discountId.trim() : null,
       payment_reference: paymentReference.trim() || null,
@@ -225,6 +226,12 @@ export default function ImportPreviousOrderModal({
                 {ORDER_TYPES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
             </div>
+            {orderType === 'dine_in' && (
+              <div>
+                <label style={labelStyle}>Table # (optional)</label>
+                <input className="input" value={tableNumber} onChange={e => setTableNumber(e.target.value)} placeholder="e.g. Table 4" style={fieldStyle} />
+              </div>
+            )}
             <div>
               <label style={labelStyle}>Discount</label>
               <select className="input" value={discountType} onChange={e => setDiscountType(e.target.value as DiscountType)} style={fieldStyle}>

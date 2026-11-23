@@ -76,6 +76,7 @@ export default function PointOfSale() {
   const [cart, setCart] = useState<CartItem[]>([])
   const [method, setMethod] = useState<'cash' | 'gcash' | 'maya' | 'card'>('cash')
   const [orderType, setOrderType] = useState<OrderType>('dine_in')
+  const [tableNumber, setTableNumber] = useState('')
   const [discountType, setDiscountType] = useState<DiscountType>('none')
   const [discountId, setDiscountId] = useState('')
   const [notes, setNotes] = useState('')
@@ -284,7 +285,7 @@ export default function PointOfSale() {
       method === 'cash' ? 'cash' : (onlineMethod ?? method)
     const trimmedNotes = notes.trim()
     const finalNotes = trimmedNotes
-    const finalTable = null
+    const finalTable = orderType === 'dine_in' && tableNumber.trim() ? tableNumber.trim() : null
     const finalDiscountId = isScPwd && discountId.trim() ? discountId.trim() : null
     const finalPaymentRef = paymentReference?.trim() || null
 
@@ -348,6 +349,7 @@ export default function PointOfSale() {
       setNotes('')
       setDiscountType('none')
       setDiscountId('')
+      setTableNumber('')
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Checkout failed')
     } finally {
@@ -552,9 +554,9 @@ export default function PointOfSale() {
             </div>
           )}
 
-          {/* Order Type (Dine-In, Take-Out) */}
+          {/* Order Type (Dine-In, Take-Out) & Table # */}
           <div style={{ marginBottom: 10 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 6 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 6, marginBottom: orderType === 'dine_in' ? 6 : 0 }}>
               {([
                 { key: 'dine_in',  label: 'Dine-In' },
                 { key: 'take_out', label: 'Take-Out' },
@@ -575,6 +577,23 @@ export default function PointOfSale() {
                 </button>
               ))}
             </div>
+            {orderType === 'dine_in' && (
+              <select
+                id="pos-table-select"
+                value={tableNumber}
+                onChange={e => setTableNumber(e.target.value)}
+                style={{
+                  width: '100%', padding: '6px 10px', borderRadius: 6, fontSize: 12,
+                  border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)',
+                  color: 'var(--sidebar-foreground)', outline: 'none',
+                }}
+              >
+                <option value="" style={{ color: '#111' }}>Table # (Optional — Counter / Walk-In)</option>
+                {Array.from({ length: 12 }, (_, i) => `Table ${i + 1}`).map(t => (
+                  <option key={t} value={t} style={{ color: '#111' }}>{t}</option>
+                ))}
+              </select>
+            )}
           </div>
 
           {/* Statutory Discount (None / Senior Citizen 20% / PWD 20%) */}
@@ -864,6 +883,22 @@ export default function PointOfSale() {
                   </button>
                 ))}
               </div>
+              {orderType === 'dine_in' && (
+                <select
+                  value={tableNumber}
+                  onChange={e => setTableNumber(e.target.value)}
+                  style={{
+                    width: '100%', padding: '7px 10px', borderRadius: 6, fontSize: 13, marginBottom: 10,
+                    border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)',
+                    color: 'var(--sidebar-foreground)', outline: 'none',
+                  }}
+                >
+                  <option value="" style={{ color: '#111' }}>Table # (Optional — Counter / Walk-In)</option>
+                  {Array.from({ length: 12 }, (_, i) => `Table ${i + 1}`).map(t => (
+                    <option key={t} value={t} style={{ color: '#111' }}>{t}</option>
+                  ))}
+                </select>
+              )}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, marginBottom: 10 }}>
                 {([
                   { key: 'none',   label: 'Regular' },
@@ -1071,7 +1106,7 @@ export default function PointOfSale() {
           initialMethod={method === 'cash' ? undefined : method}
           orderMeta={{
             order_type: orderType,
-            table_number: null,
+            table_number: orderType === 'dine_in' && tableNumber.trim() ? tableNumber.trim() : null,
             discount_type: discountType,
             discount_id: isScPwd && discountId.trim() ? discountId.trim() : null,
             discount_amount: discountAmount,
